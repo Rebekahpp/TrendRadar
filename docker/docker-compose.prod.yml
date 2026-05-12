@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  ai-radar:
+    image: ghcr.io/rebekahpp/ai-radar:latest
+    container_name: ai-radar
+    restart: unless-stopped
+    environment:
+      - PORT=9090
+      - CONTENT_ENGINE_PATH=/app/content-engine
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - TOKENKEY_API_KEY=${TOKENKEY_API_KEY}
+      - TOKENKEY_GPT_KEY=${TOKENKEY_GPT_KEY}
+      - TOKENKEY_API_BASE=${TOKENKEY_API_BASE:-https://api.tokenkey.cn}
+    volumes:
+      - ai-radar-output:/data/output
+      - ai-radar-content:/data/content-data
+    networks:
+      - coolify
+    # Traefik routing is configured via /traefik/dynamic/ai-radar.yaml in coolify-proxy
+    # No Docker labels needed - using file-based config like other services
+
+volumes:
+  ai-radar-output:
+  ai-radar-content:
+
+networks:
+  coolify:
+    external: true
