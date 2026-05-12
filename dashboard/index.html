@@ -171,10 +171,13 @@ button { font-family: inherit; }
   align-items: center;
   justify-content: space-between;
   margin-bottom: 20px;
+  gap: 12px;
+  flex-wrap: wrap;
 }
-.header-left h2 { font-size: 22px; font-weight: 700; }
-.header-left .meta { color: var(--text-muted); font-size: 13px; margin-top: 2px; }
-.header-actions { display: flex; gap: 8px; align-items: center; }
+.header-left { min-width: 0; flex-shrink: 1; }
+.header-left h2 { font-size: 22px; font-weight: 700; white-space: nowrap; }
+.header-left .meta { color: var(--text-muted); font-size: 13px; margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.header-actions { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
 .search-box {
   display: flex;
   align-items: center;
@@ -473,6 +476,66 @@ button { font-family: inherit; }
   overflow: hidden;
   line-height: 1.5;
 }
+.news-brief {
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  line-height: 1.55;
+  padding: 6px 10px;
+  margin: 2px 0 0 30px;
+  background: linear-gradient(135deg, #f8f9fb 0%, #f0f4ff 100%);
+  border-radius: 6px;
+  border-left: 2px solid var(--accent);
+  overflow-wrap: break-word;
+  word-break: break-word;
+}
+.news-brief.loading {
+  color: var(--text-muted);
+  font-style: italic;
+  background: #f8f9fb;
+  border-left-color: var(--text-muted);
+}
+.news-brief .brief-model {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-top: 3px;
+}
+.btn-gen-brief {
+  font-size: 10px;
+  padding: 2px 8px;
+  color: var(--purple);
+  background: var(--purple-bg);
+  border: 1px solid #e9e5ff;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all .15s;
+  white-space: nowrap;
+}
+.btn-gen-brief:hover { background: #ede9fe; border-color: var(--purple); }
+.btn-gen-brief:disabled { opacity: .5; cursor: wait; }
+.batch-brief-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  background: var(--purple-bg);
+  border-radius: 8px;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--purple);
+}
+.batch-brief-bar button {
+  font-size: 12px;
+  padding: 4px 14px;
+  background: var(--purple);
+  color: white;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 600;
+}
+.batch-brief-bar button:hover { opacity: .9; }
+.batch-brief-bar button:disabled { opacity: .5; cursor: wait; }
+.batch-brief-bar .progress { font-weight: 600; }
 
 /* ---- TOPIC WORKBENCH ---- */
 .topic-bench {
@@ -1101,7 +1164,7 @@ async function analyzeAllPicked() {
   for (var i = 0; i < pickedTopics.length; i++) {
     var p = pickedTopics[i];
     try {
-      var resp = await fetch('/api/start-analysis', {
+      var resp = await fetch('/api/analyze', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ topic: p.title, context: p.url || '' })
       });
@@ -1128,7 +1191,7 @@ function clearAllPicks() {
 async function quickAnalyze(topic) {
   if (!confirm('启动多模型分析：\n\n' + topic + '\n\n将使用 4 个模型并行分析，约需 1-3 分钟。')) return;
   try {
-    var resp = await fetch('/api/start-analysis', {
+    var resp = await fetch('/api/analyze', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ topic: topic })
@@ -1143,6 +1206,138 @@ async function quickAnalyze(topic) {
   } catch(e) {
     alert('请求失败: ' + e.message);
   }
+}
+
+// ---- News Brief Generation ----
+
+async function generateBrief(title, url, btnEl) {
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = '⏳ 生成中...'; }
+  // Add a loading placeholder
+  var cardEl = btnEl ? btnEl.closest('.news-card') : null;
+  var briefEl = cardEl ? cardEl.querySelector('.news-brief') : null;
+  if (!briefEl && cardEl) {
+    briefEl = document.createElement('div');
+    briefEl.className = 'news-brief loading';
+    briefEl.textContent = '正在生成摘要...';
+    // Insert after title row
+    var actionsEl = cardEl.querySelector('.news-actions');
+    if (actionsEl) cardEl.insertBefore(briefEl, actionsEl);
+    else cardEl.appendChild(briefEl);
+  } else if (briefEl) {
+    briefEl.className = 'news-brief loading';
+    briefEl.textContent = '正在生成摘要...';
+  }
+  try {
+    var resp = await fetch('/api/generate-brief', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ title: title, url: url || '' })
+    });
+    var data = await resp.json();
+    if (data.brief) {
+      if (briefEl) {
+        briefEl.className = 'news-brief';
+        briefEl.textContent = data.brief;
+      }
+      if (btnEl) { btnEl.textContent = '✓ 已生成'; btnEl.style.color = 'var(--green)'; }
+    } else {
+      if (briefEl) { briefEl.className = 'news-brief'; briefEl.textContent = '⚠️ ' + (data.error || '生成失败'); }
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = '✨ 重试'; }
+    }
+  } catch(e) {
+    if (briefEl) { briefEl.className = 'news-brief'; briefEl.textContent = '⚠️ 请求失败'; }
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = '✨ 重试'; }
+  }
+}
+
+var _batchBriefJobId = null;
+async function generateBriefsBatch() {
+  var items = (window._currentAIItems || []).filter(function(it) { return it.title && !it.brief; });
+  if (items.length === 0) { alert('所有项目都已有摘要'); return; }
+  var btn = document.getElementById('batch-brief-btn');
+  var prog = document.getElementById('batch-brief-progress');
+  if (btn) { btn.disabled = true; btn.textContent = '生成中...'; }
+  if (prog) prog.textContent = '0/' + items.length;
+  try {
+    var resp = await fetch('/api/generate-briefs-batch', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ items: items.map(function(it) { return {title: it.title, url: it.url || ''}; }) })
+    });
+    var data = await resp.json();
+    if (data.job_id) {
+      _batchBriefJobId = data.job_id;
+      // Apply already-cached briefs immediately
+      if (data.cached_briefs) {
+        Object.keys(data.cached_briefs).forEach(function(t) {
+          _applyBriefToCard(t, data.cached_briefs[t]);
+        });
+      }
+      if (prog) prog.textContent = data.already_cached + '/' + (data.total + data.already_cached);
+      // Poll for progress
+      _pollBriefBatch(data.job_id, data.total + data.already_cached);
+    } else {
+      if (btn) { btn.disabled = false; btn.textContent = '✨ 一键生成全部摘要'; }
+      alert(data.error || '启动失败');
+    }
+  } catch(e) {
+    if (btn) { btn.disabled = false; btn.textContent = '✨ 一键生成全部摘要'; }
+  }
+}
+
+async function _pollBriefBatch(jobId, totalCount) {
+  var btn = document.getElementById('batch-brief-btn');
+  var prog = document.getElementById('batch-brief-progress');
+  var poll = async function() {
+    try {
+      var resp = await fetch('/api/job?id=' + jobId);
+      var data = await resp.json();
+      if (data.results) {
+        var done = Object.keys(data.results).length;
+        if (prog) prog.textContent = done + '/' + totalCount;
+        // Apply new briefs to cards
+        Object.keys(data.results).forEach(function(t) { _applyBriefToCard(t, data.results[t]); });
+      }
+      if (data.status === 'done') {
+        if (btn) { btn.textContent = '✅ 全部完成'; }
+        // Update the stored items so re-render keeps the briefs
+        if (window._currentAIItems && data.results) {
+          window._currentAIItems.forEach(function(it) {
+            if (data.results[it.title]) it.brief = data.results[it.title];
+          });
+        }
+        return;
+      }
+      setTimeout(poll, 2000);
+    } catch(e) {
+      setTimeout(poll, 3000);
+    }
+  };
+  setTimeout(poll, 1500);
+}
+
+function _applyBriefToCard(title, brief) {
+  // Find the card with this title and update/insert the brief
+  var cards = document.querySelectorAll('.news-card');
+  cards.forEach(function(card) {
+    var titleEl = card.querySelector('div[style*="font-weight:600"]');
+    if (!titleEl) return;
+    if (titleEl.textContent.trim() === title.trim()) {
+      var existing = card.querySelector('.news-brief');
+      if (existing) {
+        existing.className = 'news-brief';
+        existing.textContent = brief;
+      } else {
+        var briefEl = document.createElement('div');
+        briefEl.className = 'news-brief';
+        briefEl.textContent = brief;
+        var actionsEl = card.querySelector('.news-actions');
+        if (actionsEl) card.insertBefore(briefEl, actionsEl);
+        else card.appendChild(briefEl);
+      }
+      // Hide the generate button
+      var genBtn = card.querySelector('.btn-gen-brief');
+      if (genBtn) { genBtn.textContent = '✓'; genBtn.style.color = 'var(--green)'; genBtn.disabled = true; }
+    }
+  });
 }
 
 async function startAnalysis() {
@@ -2867,7 +3062,7 @@ function renderContent() {
     html += '<div class="ai-select-bar">' +
       '<div style="flex:1;min-width:0">' +
       '<div style="font-weight:700;font-size:14px">📌 AI 精选选题</div>' +
-      '<div style="font-size:12px;opacity:0.85;margin-top:2px">点卡片右下角「＋选题」勾选，选好后点「分析选中话题」；或点「🔬直接分析」单条立即启动</div>' +
+      '<div style="font-size:12px;opacity:0.85;margin-top:2px">✨摘要=AI生成要点 · 🔬深度分析=启动4模型并行深度研究 · ＋选题=加入批量队列</div>' +
       '</div>' +
       '<div style="display:flex;gap:8px;flex-shrink:0;align-items:center">' +
       '<span id="ai-pick-count" style="font-size:12px;opacity:0.9">已选 ' + pickedNow + ' 条</span>' +
@@ -2875,6 +3070,19 @@ function renderContent() {
       '<button style="background:rgba(255,255,255,0.15);color:white;border:1px solid rgba(255,255,255,0.4);padding:6px 10px;border-radius:7px;cursor:pointer;font-size:12px" onclick="clearAllPicks()">✕ 清空</button>' +
       '</div></div>';
     html += '<div class="section-bar" style="margin-top:4px"><h3>' + viewLabel + '</h3><span class="count">' + items.length + ' 条</span></div>';
+    // Batch brief generation bar
+    var noBriefCount = items.filter(function(it) { return !it.brief; }).length;
+    if (noBriefCount > 0) {
+      html += '<div class="batch-brief-bar">' +
+        '<span>💡 ' + (items.length - noBriefCount) + '/' + items.length + ' 条已有摘要</span>' +
+        '<span class="progress" id="batch-brief-progress"></span>' +
+        '<button id="batch-brief-btn" onclick="generateBriefsBatch()">✨ 一键生成全部摘要（' + noBriefCount + '条）</button>' +
+        '</div>';
+    } else if (items.length > 0) {
+      html += '<div class="batch-brief-bar" style="background:var(--green-bg);color:var(--green)">' +
+        '<span>✅ 所有 ' + items.length + ' 条资讯均已有摘要</span></div>';
+    }
+    window._currentAIItems = items;
   } else {
     var dateInfo = '';
     if (currentView === 'all' || currentView === 'hot') {
@@ -2907,12 +3115,17 @@ function renderContent() {
     }
 
     if (isAI) {
+      var briefHtml = '';
+      if (item.brief) {
+        briefHtml = '<div class="news-brief">' + escapeHtml(item.brief) + '</div>';
+      }
       html += '<div class="news-card' + (picked ? ' picked' : '') + '" style="flex-direction:column;gap:6px;padding:12px 14px">' +
         '<div style="display:flex;align-items:flex-start;gap:8px">' +
         '<div class="news-rank ' + rankClass + '" style="flex-shrink:0;font-size:11px;min-width:22px;height:22px">' + (rank > 99 ? '·' : rank) + '</div>' +
         '<div style="flex:1;min-width:0;font-size:13px;font-weight:600;line-height:1.45;cursor:pointer;color:var(--text)" onclick="if(\'' + escapeJs(url) + '\'!==\'#\')window.open(\'' + escapeJs(url) + '\',\'_blank\')">' + escapeHtml(item.title) + '</div>' +
         scoreHtml +
         '</div>' +
+        briefHtml +
         '<div class="news-meta" style="flex-wrap:wrap;padding-left:30px">' +
         '<span class="news-source">' + escapeHtml(item.source || '') + '</span>' +
         (item.tag ? '<span class="news-tag ' + tagColor + '">' + item.tag + '</span>' : '') +
@@ -2922,7 +3135,8 @@ function renderContent() {
         '</div>' +
         '<div class="news-actions" style="padding-left:30px;margin-top:2px">' +
         (item.id && item.crawl_count > 1 ? '<button class="pick-btn" style="font-size:10px;padding:2px 6px" onclick="event.stopPropagation();toggleTrendChart(' + item.id + ',\'' + (item.data_date || '') + '\')">📈</button>' : '') +
-        '<button class="pick-btn" style="font-size:11px;padding:3px 8px;color:#7c3aed" onclick="event.stopPropagation();quickAnalyze(\'' + escapeJs(item.title) + '\')">🔬 直接分析</button>' +
+        (!item.brief ? '<button class="btn-gen-brief" onclick="event.stopPropagation();generateBrief(\'' + escapeJs(item.title) + '\',\'' + escapeJs(url) + '\',this)">✨ 摘要</button>' : '') +
+        '<button class="pick-btn" style="font-size:11px;padding:3px 8px;color:#7c3aed" onclick="event.stopPropagation();quickAnalyze(\'' + escapeJs(item.title) + '\')">🔬 深度分析</button>' +
         '<button class="pick-btn' + (picked ? ' picked' : '') + '" style="margin-left:auto;font-size:11px;padding:3px 10px;font-weight:600" onclick="event.stopPropagation();togglePickAndUpdate(\'' + escapeJs(item.title) + '\',\'' + escapeJs(url) + '\',\'' + escapeJs(item.source || '') + '\')">' +
         (picked ? '✓ 已选' : '＋ 选题') +
         '</button>' +

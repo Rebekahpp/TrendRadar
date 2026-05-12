@@ -80,6 +80,15 @@ def _init_workflow_db():
         created_at TEXT NOT NULL,
         FOREIGN KEY (project_id) REFERENCES projects(id)
     )""")
+    # News briefs cache table
+    conn.execute("""CREATE TABLE IF NOT EXISTS news_briefs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL UNIQUE,
+        brief TEXT NOT NULL,
+        source_url TEXT DEFAULT '',
+        model_used TEXT DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
     conn.commit()
     conn.close()
 
@@ -446,6 +455,15 @@ def get_ai_filtered(date=None):
 
     # 先按日期降序（最新的在前），再按分数降序
     all_items.sort(key=lambda x: (x.get("data_date", ""), x.get("ai_score", 0)), reverse=True)
+
+    # Attach cached briefs
+    titles = [item.get("title", "") for item in all_items if item.get("title")]
+    briefs = _get_cached_briefs(titles)
+    for item in all_items:
+        t = item.get("title", "")
+        if t in briefs:
+            item["brief"] = briefs[t]
+
     return all_items
 
 
@@ -470,6 +488,118 @@ def _get_ai_filtered_single(date):
             filtered.append(n)
     filtered.sort(key=lambda x: x["ai_score"], reverse=True)
     return filtered
+
+
+# ---- News Brief Generation ----
+
+def _get_cached_briefs(titles: list) -> dict:
+    """Fetch cached briefs for a list of titles. Returns {title: brief}."""
+    if not titles:
+        return {}
+    conn = sqlite3.connect(WORKFLOW_DB)
+    conn.row_factory = sqlite3.Row
+    result = {}
+    # SQLite has a limit on variables, batch in chunks of 500
+    for i in range(0, len(titles), 500):
+        chunk = titles[i:i+500]
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = conn.execute(
+            f"SELECT title, brief FROM news_briefs WHERE title IN ({placeholders})",
+            chunk
+        ).fetchall()
+        for r in rows:
+            result[r["title"]] = r["brief"]
+    conn.close()
+    return result
+
+
+def _save_brief(title: str, brief: str, url: str = "", model: str = ""):
+    """Save a generated brief to cache."""
+    conn = sqlite3.connect(WORKFLOW_DB)
+    conn.execute(
+        "INSERT OR REPLACE INTO news_briefs (title, brief, source_url, model_used) VALUES (?, ?, ?, ?)",
+        (title, brief, url, model)
+    )
+    conn.commit()
+    conn.close()
+
+
+def _generate_brief_llm(title: str, url: str = "") -> dict:
+    """Generate a 1-3 sentence brief for a news item using LLM.
+    Returns {"brief": str, "model": str} or {"error": str}.
+    """
+    prompt = (
+        "你是一个资深科技新闻编辑。根据以下新闻标题，用1-3句话概括核心事件、关键观点和意义。"
+        "要求：简洁有力，突出关键信息，避免空话套话。只输出摘要文本，不要加标点符号开头。\n\n"
+        f"标题：{title}"
+    )
+
+    # Try models in order: DeepSeek (free/fast) → Gemini Flash → TokenKey Claude
+    import httpx
+
+    # 1. Try DeepSeek
+    ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if ds_key:
+        try:
+            resp = httpx.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 200, "temperature": 0.3},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                brief = data["choices"][0]["message"]["content"].strip()
+                return {"brief": brief, "model": "deepseek"}
+        except Exception as e:
+            print(f"[Brief] DeepSeek failed: {e}")
+
+    # 2. Try Gemini Flash
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        try:
+            resp = httpx.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}",
+                json={"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"maxOutputTokens": 200, "temperature": 0.3}},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                brief = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return {"brief": brief, "model": "gemini-flash"}
+        except Exception as e:
+            print(f"[Brief] Gemini failed: {e}")
+
+    # 3. Try TokenKey (Claude)
+    tk_key = os.environ.get("TOKENKEY_API_KEY", "")
+    tk_base = os.environ.get("TOKENKEY_API_BASE", "https://api.tokenkey.dev/v1")
+    if tk_key:
+        try:
+            resp = httpx.post(
+                f"{tk_base}/chat/completions",
+                headers={"Authorization": f"Bearer {tk_key}", "Content-Type": "application/json"},
+                json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": 200, "temperature": 0.3},
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                brief = data["choices"][0]["message"]["content"].strip()
+                return {"brief": brief, "model": "claude-sonnet"}
+        except Exception as e:
+            print(f"[Brief] TokenKey failed: {e}")
+
+    return {"error": "所有模型均不可用"}
+
+
+def _generate_and_cache_brief(title: str, url: str = "") -> dict:
+    """Generate brief and save to cache. Returns {"brief": str, "model": str} or {"error": str}."""
+    result = _generate_brief_llm(title, url)
+    if "brief" in result:
+        _save_brief(title, result["brief"], url, result.get("model", ""))
+    return result
 
 
 def _send_feishu_notification(title: str, content: str):
@@ -1107,8 +1237,71 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._update_project_stage(body)
         elif path == "/api/save-api-keys":
             self._save_api_keys(body)
+        elif path == "/api/generate-brief":
+            self._generate_brief(body)
+        elif path == "/api/generate-briefs-batch":
+            self._generate_briefs_batch(body)
         else:
             self.send_error(404)
+
+    def _generate_brief(self, body):
+        """Generate a brief for a single news item."""
+        title = body.get("title", "").strip()
+        url = body.get("url", "")
+        if not title:
+            self._json({"error": "title is required"})
+            return
+        # Check cache first
+        cached = _get_cached_briefs([title])
+        if title in cached:
+            self._json({"brief": cached[title], "cached": True})
+            return
+        # Generate
+        result = _generate_and_cache_brief(title, url)
+        if "brief" in result:
+            self._json({"brief": result["brief"], "model": result.get("model", ""), "cached": False})
+        else:
+            self._json({"error": result.get("error", "生成失败")})
+
+    def _generate_briefs_batch(self, body):
+        """Generate briefs for multiple news items in background."""
+        items = body.get("items", [])  # [{title, url}, ...]
+        if not items:
+            self._json({"error": "items is required"})
+            return
+
+        # Check cache, only generate for uncached
+        titles = [it.get("title", "") for it in items if it.get("title")]
+        cached = _get_cached_briefs(titles)
+        to_generate = [it for it in items if it.get("title", "") not in cached]
+
+        job_id = f"briefs_{int(time.time())}"
+        _running_jobs[job_id] = {
+            "status": "running", "type": "briefs",
+            "total": len(to_generate), "done": 0,
+            "cached_count": len(cached), "results": dict(cached),
+        }
+
+        def run():
+            done = 0
+            for it in to_generate:
+                t = it.get("title", "")
+                u = it.get("url", "")
+                if not t:
+                    continue
+                r = _generate_and_cache_brief(t, u)
+                done += 1
+                if "brief" in r:
+                    _running_jobs[job_id]["results"][t] = r["brief"]
+                _running_jobs[job_id]["done"] = done
+            _running_jobs[job_id]["status"] = "done"
+
+        threading.Thread(target=run, daemon=True).start()
+        self._json({
+            "job_id": job_id, "status": "started",
+            "total": len(to_generate), "already_cached": len(cached),
+            "cached_briefs": cached,
+        })
 
     def _start_analysis(self, body):
         """Start multi-model analysis in background thread."""
