@@ -337,7 +337,7 @@ button { font-family: inherit; }
 .news-list { display: flex; flex-direction: column; gap: 6px; }
 .news-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
   gap: 10px;
 }
 .news-grid .news-card { flex-direction: column; gap: 8px; }
@@ -1288,6 +1288,8 @@ async function generateBriefsBatch() {
     }
   } catch(e) {
     if (btn) { btn.disabled = false; btn.textContent = '✨ 一键生成全部摘要'; }
+    alert('请求失败: ' + e.message);
+    console.error('Brief batch error:', e);
   }
 }
 
@@ -4606,7 +4608,36 @@ document.getElementById('search').addEventListener('input', function(e) {
   renderContent();
 });
 
-loadAll();
+// 分步加载：先加载轻量数据显示概览，再加载全量数据
+(async function() {
+  // 第一步：快速加载 stats + ai-filtered + dates（很小）
+  var [stats, filtered, dates] = await Promise.all([
+    fetchJSON('/api/stats'),
+    fetchJSON('/api/ai-filtered'),
+    fetchJSON('/api/dates'),
+  ]);
+  aiFiltered = Array.isArray(filtered) ? filtered : [];
+  availableDates = Array.isArray(dates) ? dates : [];
+  renderStats(stats);
+  renderSourceNav(stats);
+  var s = typeof stats === 'object' && stats.date ? stats : { date: new Date().toISOString().slice(0,10), news_total: 0, rss_total: 0 };
+  document.getElementById('page-meta').textContent =
+    s.date + ' · 热榜 ' + s.news_total + ' 条 · RSS ' + s.rss_total + ' 条 · 每30分钟更新';
+  document.getElementById('total-badge').textContent = s.news_total + s.rss_total;
+  document.getElementById('ai-badge').textContent = aiFiltered.length;
+  renderTags();
+  renderContent();
+  renderTopicBench();
+  loadAIAnalysis();
+  // 第二步：后台加载大量全量新闻数据
+  var [news, rss] = await Promise.all([
+    fetchJSON('/api/news'),
+    fetchJSON('/api/rss'),
+  ]);
+  allNews = news;
+  allRss = rss;
+  renderContent();
+})();
 updateNavVisibility();
 setInterval(loadAll, 5 * 60 * 1000);
 </script>
