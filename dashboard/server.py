@@ -436,7 +436,15 @@ def get_ai_filtered(date=None):
     If date is None, merge the most recent 3 days to ensure continuity.
     """
     if date:
-        return _get_ai_filtered_single(date)
+        items = _get_ai_filtered_single(date)
+        # Attach cached briefs for single-date queries too
+        titles = [item.get("title", "") for item in items if item.get("title")]
+        briefs = _get_cached_briefs(titles)
+        for item in items:
+            t = item.get("title", "")
+            if t in briefs:
+                item["brief"] = briefs[t]
+        return items
 
     recent_dates = _get_recent_dates(3)
     if not recent_dates:
