@@ -1,0 +1,53 @@
+FROM python:3.12-slim-bookworm
+
+WORKDIR /app
+
+# System deps
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends gcc && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies (only what dashboard + article modules need)
+RUN pip install --no-cache-dir \
+    anthropic>=0.40.0 \
+    openai>=1.50.0 \
+    google-genai \
+    peewee>=3.17.0 \
+    feedparser>=6.0 \
+    httpx>=0.27.0 \
+    beautifulsoup4>=4.12.0 \
+    pyyaml>=6.0 \
+    pydantic>=2.0 \
+    rich>=13.0 \
+    click>=8.1.0 \
+    jinja2>=3.1.0 \
+    python-slugify>=8.0
+
+# Copy content-engine code (only needed modules)
+COPY content-engine/article/ ./content-engine/article/
+COPY content-engine/brain/ ./content-engine/brain/
+COPY content-engine/core/ ./content-engine/core/
+COPY content-engine/config.example.yaml ./config.yaml
+
+# Copy dashboard files
+COPY dashboard/ ./dashboard/
+
+# Create persistent data directories (overlaid by volumes at runtime)
+RUN mkdir -p /data/output/news /data/output/rss /data/content-data/analysis \
+    /data/content-data/articles /data/content-data/log
+
+# Symlinks so file-relative paths in content-engine resolve to persistent volumes
+RUN ln -s /data/content-data ./content-engine/content-data && \
+    ln -s /data/output ./output && \
+    ln -s /data/content-data /app/content-data
+
+ENV PYTHONUNBUFFERED=1 \
+    PORT=9090 \
+    CONTENT_ENGINE_PATH=/app/content-engine
+
+EXPOSE 9090
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:9090/api/stats')" || exit 1
+
+CMD ["python", "dashboard/server.py"]
