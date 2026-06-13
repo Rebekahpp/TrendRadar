@@ -21,7 +21,8 @@ RUN pip install --no-cache-dir \
     rich>=13.0 \
     click>=8.1.0 \
     jinja2>=3.1.0 \
-    python-slugify>=8.0
+    python-slugify>=8.0 \
+    "sentry-sdk[httpx]>=2.0"
 
 # Copy content-engine code (only needed modules)
 COPY content-engine/article/ ./content-engine/article/
@@ -34,7 +35,7 @@ COPY dashboard/ ./dashboard/
 
 # Create persistent data directories (overlaid by volumes at runtime)
 RUN mkdir -p /data/output/news /data/output/rss /data/content-data/analysis \
-    /data/content-data/articles /data/content-data/log
+    /data/content-data/articles /data/content-data/images /data/content-data/log
 
 # Symlinks so file-relative paths in content-engine resolve to persistent volumes
 RUN ln -s /data/content-data ./content-engine/content-data && \
@@ -47,7 +48,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 EXPOSE 9090
 
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:9090/api/stats')" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:9090/healthz',timeout=3); sys.exit(0 if r.status==200 else 1)" || exit 1
 
 CMD ["python", "dashboard/server.py"]

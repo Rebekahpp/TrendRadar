@@ -35,9 +35,555 @@ DATA_DIR = os.environ.get("DATA_DIR", os.path.join(os.path.dirname(__file__), ".
 DASHBOARD_DIR = os.path.dirname(__file__)
 PORT = int(os.environ.get("PORT", 9090))
 
+# ============================================================================
+# Sentry error monitoring (Stage 2.6, 2026-05-16)
+# 配置：SENTRY_BACKEND_DSN / SENTRY_ENVIRONMENT / SENTRY_RELEASE
+# 未设 DSN 时完全跳过初始化（不引入运行时开销）
+# ============================================================================
+_SENTRY_DSN = os.environ.get("SENTRY_BACKEND_DSN", "").strip()
+_SENTRY_ENV = os.environ.get("SENTRY_ENVIRONMENT", "production")
+_SENTRY_RELEASE = os.environ.get("SENTRY_RELEASE", "ai-radar@stage2.6")
+_SENTRY_TRACES_RATE = float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.05"))
+
+_SENTRY_SCRUB_KEYS = {
+    "password", "pwd", "secret", "token", "api_key", "apikey",
+    "anthropic_key", "openai_key", "airouter_key", "deepseek_key",
+    "gemini_key", "tokenkey", "wechat_app_secret", "app_secret",
+    "console_password", "dashboard_auth_password", "dashboard_bearer_token",
+    "authorization", "cookie", "set-cookie", "x-api-key",
+}
+
+
+def _sentry_before_send(event, hint):
+    """脱敏：移除请求头/body/breadcrumb 中的敏感字段。"""
+    def _scrub_dict(d):
+        if not isinstance(d, dict):
+            return
+        for k in list(d.keys()):
+            kl = str(k).lower()
+            if any(s in kl for s in _SENTRY_SCRUB_KEYS):
+                d[k] = "[scrubbed]"
+            elif isinstance(d[k], dict):
+                _scrub_dict(d[k])
+    try:
+        req = event.get("request", {})
+        _scrub_dict(req.get("headers"))
+        _scrub_dict(req.get("env"))
+        _scrub_dict(req.get("cookies"))
+        data = req.get("data")
+        if isinstance(data, dict):
+            _scrub_dict(data)
+        for bc in event.get("breadcrumbs", {}).get("values", []) or []:
+            _scrub_dict(bc.get("data"))
+        # 去掉绝对路径
+        for ex in event.get("exception", {}).get("values", []) or []:
+            for frame in (ex.get("stacktrace", {}) or {}).get("frames", []) or []:
+                if frame.get("filename"):
+                    frame["filename"] = frame["filename"].replace(CE_ROOT, "[CE]").replace(
+                        os.path.dirname(__file__), "[DASH]")
+    except Exception:
+        pass
+    return event
+
+
+if _SENTRY_DSN:
+    try:
+        import sentry_sdk
+        sentry_sdk.init(
+            dsn=_SENTRY_DSN,
+            environment=_SENTRY_ENV,
+            release=_SENTRY_RELEASE,
+            send_default_pii=False,
+            traces_sample_rate=_SENTRY_TRACES_RATE,
+            max_breadcrumbs=50,
+            before_send=_sentry_before_send,
+        )
+        print(f"[SENTRY] backend initialized env={_SENTRY_ENV} release={_SENTRY_RELEASE} traces={_SENTRY_TRACES_RATE}", flush=True)
+    except ImportError:
+        print("[SENTRY] sentry-sdk not installed, monitoring disabled", flush=True)
+        sentry_sdk = None
+    except Exception as e:
+        print(f"[SENTRY] init failed: {e}", flush=True)
+        sentry_sdk = None
+else:
+    sentry_sdk = None
+    print("[SENTRY] backend disabled (SENTRY_BACKEND_DSN not set)", flush=True)
+
+
+def _sentry_capture(exc, **tags):
+    """在被 try/except 吞掉的关键路径手动上报。Sentry 未启用时静默忽略。"""
+    if sentry_sdk is None:
+        return
+    try:
+        with sentry_sdk.push_scope() as scope:
+            for k, v in tags.items():
+                scope.set_tag(k, str(v)[:200])
+            sentry_sdk.capture_exception(exc)
+    except Exception:
+        pass
+
+
+# ============================================================================
+# Security stage 1 (2026-05-12): auth / CORS / SSRF / file disclosure
+# 配置方式（环境变量）：
+#   DASHBOARD_AUTH_USER + DASHBOARD_AUTH_PASSWORD   HTTP Basic 凭证
+#   DASHBOARD_BEARER_TOKEN                          Bearer token（任选其一）
+#   DASHBOARD_ALLOWED_ORIGINS                       CORS 白名单，逗号分隔
+#   DASHBOARD_MAX_BODY_SIZE                         POST body 上限，默认 10MB
+#   CONSOLE_PASSWORD                                控制台密码（必须设置）
+# ============================================================================
+import base64 as _b64
+import hmac as _hmac
+import ipaddress as _ipaddress
+import socket as _socket
+import tempfile as _tempfile
+from urllib.parse import urlparse as _sec_urlparse
+
+_AUTH_USER = os.environ.get("DASHBOARD_AUTH_USER", "")
+_AUTH_PASSWORD = os.environ.get("DASHBOARD_AUTH_PASSWORD", "")
+_BEARER_TOKEN = os.environ.get("DASHBOARD_BEARER_TOKEN", "")
+_ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+_MAX_BODY_SIZE = int(os.environ.get("DASHBOARD_MAX_BODY_SIZE", str(10 * 1024 * 1024)))
+_CONSOLE_PASSWORD = os.environ.get("CONSOLE_PASSWORD", "")
+_AUTH_CONFIGURED = bool(_BEARER_TOKEN or (_AUTH_USER and _AUTH_PASSWORD))
+
+if not _AUTH_CONFIGURED:
+    print("[SECURITY] DASHBOARD_AUTH_USER+DASHBOARD_AUTH_PASSWORD or DASHBOARD_BEARER_TOKEN not set — /api/* will return 503", flush=True)
+if not _CONSOLE_PASSWORD:
+    print("[SECURITY] CONSOLE_PASSWORD not set — console operations (save-api-keys / set-feishu-webhook / verify-console) disabled", flush=True)
+
+# 静态文件白名单：默认 SimpleHTTPRequestHandler 会服务目录下所有文件
+_STATIC_WHITELIST = {"/", "/index.html", "/favicon.svg", "/robots.txt"}
+
+# /api/analysis-detail 和 /api/article-detail 只允许这些前缀
+_ANALYSIS_STORE = os.path.realpath(os.path.join(CE_ROOT, "content-data", "analysis"))
+_ARTICLE_STORE = os.path.realpath(os.path.join(CE_ROOT, "content-data", "articles"))
+# 容器内同一卷可能挂载到多个路径（/app/content-engine/content-data 和 /data/content-data）
+# 两个路径都必须允许，否则旧 DB 记录的文件路径会被安全检查拦住
+_ALLOWED_DETAIL_PREFIXES = [_ANALYSIS_STORE, _ARTICLE_STORE]
+_ALT_DATA_ROOT = "/data/content-data"
+if os.path.isdir(_ALT_DATA_ROOT):
+    _ALLOWED_DETAIL_PREFIXES.append(os.path.realpath(os.path.join(_ALT_DATA_ROOT, "analysis")))
+    _ALLOWED_DETAIL_PREFIXES.append(os.path.realpath(os.path.join(_ALT_DATA_ROOT, "articles")))
+_FORBIDDEN_DETAIL_EXTS = {".env", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".py", ".sh", ".db", ".sqlite", ".pem", ".key", ".crt", ".pfx"}
+
+# 图片存储目录
+_IMAGE_STORE = os.path.join(CE_ROOT, "content-data", "images")
+
+
+def _generate_and_embed_images(article_content: str) -> tuple:
+    """Generate images for [IMAGE: ...] placeholders and embed URLs into markdown.
+
+    Returns (updated_content, image_results_list).
+    """
+    try:
+        from article.image_gen import generate_article_images
+        import re as _re
+        image_results = generate_article_images(article_content, max_images=4)
+        if not image_results:
+            return article_content, []
+
+        content = article_content
+        for img in image_results:
+            if "filename" in img and "description" in img:
+                desc_escaped = _re.escape(img["description"])
+                pattern = r'\[IMAGE:\s*' + desc_escaped + r'\]'
+                replacement = '![{}](/api/article-image?file={})'.format(
+                    img["description"], img["filename"]
+                )
+                content = _re.sub(pattern, replacement, content, count=1)
+
+        successful = [i for i in image_results if "filename" in i]
+        failed = [i for i in image_results if "error" in i]
+        print(f"[ImageGen] {len(successful)} images generated, {len(failed)} failed")
+        return content, image_results
+    except Exception as e:
+        print(f"[ImageGen] Failed to generate images: {e}")
+        return article_content, [{"error": str(e)}]
+
+# SSRF 防护：内网 / 链路本地 / 保留段
+_PRIVATE_NETS = [
+    _ipaddress.ip_network("127.0.0.0/8"),
+    _ipaddress.ip_network("10.0.0.0/8"),
+    _ipaddress.ip_network("172.16.0.0/12"),
+    _ipaddress.ip_network("192.168.0.0/16"),
+    _ipaddress.ip_network("169.254.0.0/16"),
+    _ipaddress.ip_network("100.64.0.0/10"),
+    _ipaddress.ip_network("0.0.0.0/8"),
+    _ipaddress.ip_network("::1/128"),
+    _ipaddress.ip_network("fc00::/7"),
+    _ipaddress.ip_network("fe80::/10"),
+]
+
+
+def _is_private_or_invalid_url(url: str) -> bool:
+    """SSRF 检查。返回 True 表示拒绝。仅允许 http/https 公网地址。"""
+    if not url:
+        return True
+    try:
+        parsed = _sec_urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return True
+        host = parsed.hostname
+        if not host:
+            return True
+        # 直接 IP
+        try:
+            ip = _ipaddress.ip_address(host)
+            return any(ip in net for net in _PRIVATE_NETS)
+        except ValueError:
+            pass
+        # 解析所有 A/AAAA 记录
+        try:
+            infos = _socket.getaddrinfo(host, None)
+        except Exception:
+            return True
+        for info in infos:
+            addr = info[4][0].split("%")[0]
+            try:
+                ip = _ipaddress.ip_address(addr)
+                if any(ip in net for net in _PRIVATE_NETS):
+                    return True
+            except ValueError:
+                continue
+        return False
+    except Exception:
+        return True
+
+
+def _atomic_write_text(path: str, content: str):
+    """原子写入文本：tempfile → fsync → os.replace。崩溃不损坏目标文件。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = _tempfile.mkstemp(prefix=".tmp_", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _is_safe_detail_path(fpath: str) -> bool:
+    """analysis-detail / article-detail 的路径白名单：必须落在 analysis/articles 子目录里 + 安全扩展名。"""
+    if not fpath:
+        return False
+    real = os.path.realpath(fpath)
+    if not any(real.startswith(p + os.sep) or real == p for p in _ALLOWED_DETAIL_PREFIXES):
+        return False
+    ext = os.path.splitext(real)[1].lower()
+    if ext in _FORBIDDEN_DETAIL_EXTS:
+        return False
+    return True
+
+
+# ============================================================================
+# Stage 2 hardening (2026-05-12): rate limit / audit log / weak password warn / LLM caps
+# ============================================================================
+import threading as _sec_thr
+
+# ---- 1. Weak password warning at boot ----
+_WEAK_PASSWORDS = {
+    "radar2026", "admin", "admin123", "password", "12345678", "qwerty",
+    "test", "demo", "root", "letmein", "changeme", "123456", "111111",
+}
+
+def _check_password_strength():
+    issues = []
+    if _AUTH_PASSWORD and (len(_AUTH_PASSWORD) < 12 or _AUTH_PASSWORD.lower() in _WEAK_PASSWORDS):
+        issues.append("DASHBOARD_AUTH_PASSWORD too weak (>=12 chars, not in common list)")
+    if _BEARER_TOKEN and len(_BEARER_TOKEN) < 24:
+        issues.append("DASHBOARD_BEARER_TOKEN too short (>=24 chars recommended)")
+    if _CONSOLE_PASSWORD and (len(_CONSOLE_PASSWORD) < 12 or _CONSOLE_PASSWORD.lower() in _WEAK_PASSWORDS):
+        issues.append("CONSOLE_PASSWORD too weak (>=12 chars, not in common list)")
+    for m in issues:
+        print(f"[SECURITY] {m}", flush=True)
+
+_check_password_strength()
+
+# ---- 2. Token-bucket rate limit per client (IP or token) ----
+_rate_state = {}
+_rate_lock = _sec_thr.Lock()
+_RATE_GENERAL = float(os.environ.get("DASHBOARD_RATE_GENERAL", "10"))   # req/s
+_RATE_LLM = float(os.environ.get("DASHBOARD_RATE_LLM", "1"))             # req/s
+_RATE_BURST = float(os.environ.get("DASHBOARD_RATE_BURST", "30"))        # burst
+_LLM_PATHS = {
+    "/api/analyze", "/api/generate-article", "/api/review-article", "/api/revise-article",
+    "/api/generate-brief", "/api/generate-briefs-batch", "/api/translate",
+    "/api/video/generate-script", "/api/video/script-from-article",
+    "/api/fetch-page-text", "/api/repurpose", "/api/generate-comments",
+    "/api/scan-topics", "/api/competitors/scan",
+}
+
+def _rate_allow(client_id: str, path: str) -> bool:
+    """Token bucket。LLM 路径限速更严。client_id 不存在时按 IP 计。"""
+    now = time.time()
+    rate = _RATE_LLM if path in _LLM_PATHS else _RATE_GENERAL
+    with _rate_lock:
+        st = _rate_state.get(client_id)
+        if st is None:
+            st = {"tokens": _RATE_BURST, "ts": now}
+            _rate_state[client_id] = st
+        elapsed = now - st["ts"]
+        st["tokens"] = min(_RATE_BURST, st["tokens"] + elapsed * rate)
+        st["ts"] = now
+        if st["tokens"] < 1:
+            return False
+        st["tokens"] -= 1
+        # 简单 GC：超过 1000 条记录，淘汰最旧
+        if len(_rate_state) > 1000:
+            try:
+                oldest = min(_rate_state.items(), key=lambda kv: kv[1]["ts"])[0]
+                _rate_state.pop(oldest, None)
+            except ValueError:
+                pass
+        return True
+
+
+# ---- 2b. Login brute-force protection (per IP) ----
+_login_attempts = {}  # {ip: {"count": int, "first_at": float, "locked_until": float}}
+_login_lock = _sec_thr.Lock()
+_LOGIN_MAX_ATTEMPTS = int(os.environ.get("LOGIN_MAX_ATTEMPTS", "5"))
+_LOGIN_WINDOW = float(os.environ.get("LOGIN_WINDOW", "60"))    # seconds
+_LOGIN_LOCKOUT = float(os.environ.get("LOGIN_LOCKOUT", "300")) # 5 min lockout
+
+def _login_check(ip: str) -> tuple:
+    """检查 IP 是否可以尝试登录。返回 (allowed, remaining_seconds)。"""
+    now = time.time()
+    with _login_lock:
+        rec = _login_attempts.get(ip)
+        if rec is None:
+            return True, 0
+        # 锁定期间
+        if rec.get("locked_until", 0) > now:
+            return False, int(rec["locked_until"] - now)
+        # 窗口过期，重置
+        if now - rec["first_at"] > _LOGIN_WINDOW:
+            _login_attempts.pop(ip, None)
+            return True, 0
+        # 窗口内但未超限
+        if rec["count"] < _LOGIN_MAX_ATTEMPTS:
+            return True, 0
+        # 超限，进入锁定
+        rec["locked_until"] = now + _LOGIN_LOCKOUT
+        return False, int(_LOGIN_LOCKOUT)
+
+def _login_record_failure(ip: str):
+    """记录一次登录失败。"""
+    now = time.time()
+    with _login_lock:
+        rec = _login_attempts.get(ip)
+        if rec is None or now - rec["first_at"] > _LOGIN_WINDOW:
+            _login_attempts[ip] = {"count": 1, "first_at": now, "locked_until": 0}
+        else:
+            rec["count"] += 1
+        # GC：防止内存无限增长
+        if len(_login_attempts) > 5000:
+            cutoff = now - _LOGIN_WINDOW * 2
+            stale = [k for k, v in _login_attempts.items() if v["first_at"] <= cutoff]
+            for k in stale:
+                _login_attempts.pop(k, None)
+
+def _login_reset(ip: str):
+    """登录成功后清除该 IP 的失败记录。"""
+    with _login_lock:
+        _login_attempts.pop(ip, None)
+
+
+# ---- 3. Audit log ----
+_audit_initialized = False
+_audit_lock = _sec_thr.Lock()
+
+def _init_audit_log():
+    global _audit_initialized
+    if _audit_initialized:
+        return
+    try:
+        os.makedirs(os.path.dirname(WORKFLOW_DB), exist_ok=True)
+        conn = sqlite3.connect(WORKFLOW_DB, timeout=30)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                actor TEXT,
+                action TEXT NOT NULL,
+                target TEXT,
+                detail TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(ts)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action)")
+        conn.commit()
+        conn.close()
+        _audit_initialized = True
+    except Exception as e:
+        print(f"[AUDIT] init failed: {e}", flush=True)
+
+
+def _audit(actor: str, action: str, target: str = "", detail: str = ""):
+    """写入审计日志。不抛异常。"""
+    if not _audit_initialized:
+        _init_audit_log()
+    try:
+        with _audit_lock:
+            conn = sqlite3.connect(WORKFLOW_DB, timeout=10)
+            conn.execute(
+                "INSERT INTO audit_log (ts, actor, action, target, detail) VALUES (?, ?, ?, ?, ?)",
+                (datetime.now().isoformat(), (actor or "")[:64], (action or "")[:64],
+                 (target or "")[:256], (detail or "")[:1024])
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[AUDIT] write failed action={action}: {e}", flush=True)
+
+
+# ---- 4. LLM input length caps ----
+_LLM_TOPIC_MAX = int(os.environ.get("DASHBOARD_LLM_TOPIC_MAX", "500"))
+_LLM_CONTEXT_MAX = int(os.environ.get("DASHBOARD_LLM_CONTEXT_MAX", "20000"))
+_LLM_TEXT_MAX = int(os.environ.get("DASHBOARD_LLM_TEXT_MAX", "30000"))
+
+def _cap_llm_input(value: str, limit: int) -> str:
+    if not value:
+        return value
+    if len(value) > limit:
+        return value[:limit] + "...[truncated]"
+    return value
+
+
+# ---- 5. Sanitized error message for API responses ----
+def _safe_err(exc, capture: bool = True) -> str:
+    """对外暴露的错误信息：去除文件路径，截短。
+    capture=True 时同步上报到 Sentry（如果已配置 DSN）。"""
+    if capture:
+        _sentry_capture(exc, source="safe_err")
+    try:
+        msg = str(exc)
+    except Exception:
+        return "internal error"
+    try:
+        msg = msg.replace(CE_ROOT, "[...]").replace(os.path.dirname(__file__), "[...]")
+    except Exception:
+        pass
+    return msg[:200] if msg else (exc.__class__.__name__ if hasattr(exc, "__class__") else "error")
+
+
+# ---- 6. Cookie session login (Stage 2.5, 2026-05-13) ----
+import secrets as _sec_secrets
+
+_SESSION_COOKIE = "ai_radar_session"
+_SESSION_LIFETIME = int(os.environ.get("DASHBOARD_SESSION_DAYS", "7")) * 86400
+_sessions = {}  # token -> {"user": str, "expires_at": float}
+_sessions_lock = _sec_thr.Lock()
+
+
+def _session_create(user: str) -> str:
+    token = _sec_secrets.token_urlsafe(32)
+    with _sessions_lock:
+        _sessions[token] = {"user": user, "expires_at": time.time() + _SESSION_LIFETIME}
+        # GC 过期 / 超量
+        if len(_sessions) > 200:
+            now = time.time()
+            for t in list(_sessions.keys()):
+                if _sessions[t]["expires_at"] < now:
+                    _sessions.pop(t, None)
+    return token
+
+
+def _session_valid(token: str):
+    """返回 user name if valid, else None。"""
+    if not token:
+        return None
+    with _sessions_lock:
+        s = _sessions.get(token)
+        if not s:
+            return None
+        if s["expires_at"] < time.time():
+            _sessions.pop(token, None)
+            return None
+        return s.get("user")
+
+
+def _session_revoke(token: str):
+    with _sessions_lock:
+        _sessions.pop(token, None)
+
+
+# ---- 6b. CSRF token（绑定到 session，防跨站请求伪造） ----
+_csrf_store = {}  # session_token -> csrf_token
+_csrf_lock = _sec_thr.Lock()
+
+
+def _csrf_generate(session_token: str) -> str:
+    """为指定 session 生成并存储 CSRF token，返回 csrf token。"""
+    csrf_token = _sec_secrets.token_hex(32)
+    with _csrf_lock:
+        _csrf_store[session_token] = csrf_token
+        # 顺带 GC：清理已失效 session 对应的 csrf token
+        valid_sessions = set(_sessions.keys())
+        for t in list(_csrf_store.keys()):
+            if t not in valid_sessions:
+                _csrf_store.pop(t, None)
+    return csrf_token
+
+
+def _csrf_validate(session_token: str, csrf_token: str) -> bool:
+    """验证 csrf_token 是否与 session_token 匹配。"""
+    if not session_token or not csrf_token:
+        return False
+    with _csrf_lock:
+        expected = _csrf_store.get(session_token)
+    if not expected:
+        return False
+    try:
+        return _hmac.compare_digest(expected, csrf_token)
+    except Exception:
+        return False
+
+
+def _parse_cookies(header_value: str):
+    result = {}
+    if not header_value:
+        return result
+    for part in header_value.split(";"):
+        kv = part.strip().split("=", 1)
+        if len(kv) == 2:
+            result[kv[0]] = kv[1]
+    return result
+
+
 _topic_scan_timer = None
 _skipped_topics = set()
+_pending_approvals = {}  # topic -> {topic, write_value, hot_score, added_time}
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+
+# Persist skipped topics to disk so they survive server restarts
+_SKIPPED_TOPICS_FILE = os.path.join(DATA_DIR, ".skipped_topics.json")
+
+def _load_skipped_topics():
+    global _skipped_topics
+    try:
+        if os.path.exists(_SKIPPED_TOPICS_FILE):
+            with open(_SKIPPED_TOPICS_FILE) as f:
+                _skipped_topics = set(json.load(f))
+    except Exception:
+        _skipped_topics = set()
+
+def _save_skipped_topics():
+    try:
+        os.makedirs(os.path.dirname(_SKIPPED_TOPICS_FILE), exist_ok=True)
+        with open(_SKIPPED_TOPICS_FILE, "w") as f:
+            json.dump(list(_skipped_topics), f, ensure_ascii=False)
+    except Exception:
+        pass
+
+_load_skipped_topics()
 
 # System health tracking
 _system_health = {
@@ -88,6 +634,17 @@ def _init_workflow_db():
         source_url TEXT DEFAULT '',
         model_used TEXT DEFAULT '',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
+    # Page text cache table — stores fetched page content
+    conn.execute("""CREATE TABLE IF NOT EXISTS page_texts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        url TEXT NOT NULL UNIQUE,
+        page_text TEXT NOT NULL DEFAULT '',
+        fetch_status TEXT NOT NULL DEFAULT 'ok',
+        error_detail TEXT DEFAULT '',
+        content_length INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     conn.commit()
     conn.close()
@@ -161,7 +718,14 @@ def _ensure_topic_events_tables():
 
 
 def _workflow_conn():
-    return sqlite3.connect(WORKFLOW_DB)
+    # Stage 2: 30s busy timeout + WAL for concurrent reads/writes
+    conn = sqlite3.connect(WORKFLOW_DB, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return conn
 
 
 def _create_project(topic: str, analysis_file: str = "") -> int:
@@ -191,6 +755,8 @@ def _update_project(pid: int, **kwargs):
     conn.execute(f"UPDATE projects SET {sets} WHERE id = ?", vals)
     conn.commit()
     conn.close()
+    # 使 list_analyses 缓存失效，确保下次请求拿到最新 stage
+    _analyses_cache.clear()
 
 
 def _add_project_event(pid: int, event_type: str, detail: str = ""):
@@ -411,7 +977,7 @@ def _has_tech_signal(title: str) -> bool:
                 weak_hit = True
             else:
                 strong_hit = True
-    return strong_hit or False
+    return strong_hit or (weak_hit and strong_hit)
 
 
 def _get_recent_dates(days=3):
@@ -444,6 +1010,15 @@ def get_ai_filtered(date=None):
             t = item.get("title", "")
             if t in briefs:
                 item["brief"] = briefs[t]
+        # Attach cached page texts
+        urls = [it.get("url") or it.get("mobile_url") or "" for it in items]
+        urls = [u for u in urls if u and u != "#"]
+        pt = _get_cached_page_texts(urls)
+        for it in items:
+            u = it.get("url") or it.get("mobile_url") or ""
+            if u in pt:
+                it["page_text"] = pt[u]["text"]
+                it["page_text_status"] = pt[u]["status"]
         return items
 
     recent_dates = _get_recent_dates(3)
@@ -471,6 +1046,16 @@ def get_ai_filtered(date=None):
         t = item.get("title", "")
         if t in briefs:
             item["brief"] = briefs[t]
+
+    # Attach cached page texts
+    urls = [item.get("url") or item.get("mobile_url") or "" for item in all_items]
+    urls = [u for u in urls if u and u != "#"]
+    page_texts = _get_cached_page_texts(urls)
+    for item in all_items:
+        u = item.get("url") or item.get("mobile_url") or ""
+        if u in page_texts:
+            item["page_text"] = page_texts[u]["text"]
+            item["page_text_status"] = page_texts[u]["status"]
 
     return all_items
 
@@ -530,6 +1115,385 @@ def _save_brief(title: str, brief: str, url: str = "", model: str = ""):
     )
     conn.commit()
     conn.close()
+
+
+# ---- Page Text Cache ----
+
+def _get_cached_page_texts(urls: list) -> dict:
+    """Fetch cached page texts for a list of URLs. Returns {url: {"text": str, "status": str}}."""
+    if not urls:
+        return {}
+    conn = sqlite3.connect(WORKFLOW_DB)
+    conn.row_factory = sqlite3.Row
+    result = {}
+    for i in range(0, len(urls), 500):
+        chunk = urls[i:i+500]
+        placeholders = ",".join(["?"] * len(chunk))
+        rows = conn.execute(
+            f"SELECT url, page_text, fetch_status FROM page_texts WHERE url IN ({placeholders})",
+            chunk
+        ).fetchall()
+        for r in rows:
+            result[r["url"]] = {"text": r["page_text"], "status": r["fetch_status"]}
+    conn.close()
+    return result
+
+
+def _save_page_text(url: str, text: str, status: str = "ok", error: str = ""):
+    """Save fetched page text to cache."""
+    conn = sqlite3.connect(WORKFLOW_DB)
+    conn.execute(
+        "INSERT OR REPLACE INTO page_texts (url, page_text, fetch_status, error_detail, content_length, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+        (url, text, status, error, len(text))
+    )
+    conn.commit()
+    conn.close()
+
+
+def _purge_bad_page_texts():
+    """Remove cached page texts that are known boilerplate / anti-scrape junk.
+    Called once on startup to clean stale data so it gets re-fetched with improved logic."""
+    _JUNK_MARKERS = [
+        '知乎，让每一次点击都充满意义',
+        'Sina Visitor System',
+        '新浪访客系统',
+        '百度搜索', '百度一下',
+        '网络不给力，请稍后重试',
+        'Just a moment',
+        'Checking your browser',
+        'Access Denied',
+        '请输入验证码',
+    ]
+    try:
+        conn = sqlite3.connect(WORKFLOW_DB)
+        total_purged = 0
+        for marker in _JUNK_MARKERS:
+            cur = conn.execute(
+                "DELETE FROM page_texts WHERE page_text LIKE ?",
+                (f"%{marker}%",)
+            )
+            total_purged += cur.rowcount
+        # Also purge entries that are very short "ok" status (likely garbage)
+        cur2 = conn.execute(
+            "DELETE FROM page_texts WHERE fetch_status = 'ok' AND content_length < 50"
+        )
+        total_purged += cur2.rowcount
+        # Purge old toutiao.com entries that were marked "empty" (now handled via mobile API)
+        cur_tt = conn.execute(
+            "DELETE FROM page_texts WHERE url LIKE '%toutiao.com%' AND fetch_status IN ('empty', 'error')"
+        )
+        if cur_tt.rowcount > 0:
+            print(f"[PageText] Purged {cur_tt.rowcount} stale toutiao.com entries (will re-fetch via mobile API)")
+        total_purged += cur_tt.rowcount
+        # Also purge entries with highly repetitive content (same line repeated)
+        rows = conn.execute(
+            "SELECT url, page_text FROM page_texts WHERE fetch_status = 'ok' AND content_length > 0"
+        ).fetchall()
+        for row in rows:
+            url_val, text_val = row
+            if not text_val:
+                continue
+            lines = [l.strip() for l in text_val.split('\n') if l.strip()]
+            if len(lines) > 3:
+                unique = set(lines)
+                if len(unique) <= 2:  # Same 1-2 lines repeated many times
+                    conn.execute("DELETE FROM page_texts WHERE url = ?", (url_val,))
+                    total_purged += 1
+        conn.commit()
+        conn.close()
+        if total_purged > 0:
+            print(f"[PageText] Purged {total_purged} bad cached entries on startup")
+    except Exception as e:
+        print(f"[PageText] Purge error: {e}")
+
+_purge_bad_page_texts()
+
+
+def _fetch_toutiao_content(url: str) -> dict:
+    """Fetch article content from Toutiao via mobile API.
+
+    Handles two URL patterns:
+    - /trending/{topic_id}/  → fetch article list via feed API → get top article content
+    - /article/{id} or /group/{id}/ → get content directly via mobile API
+
+    Returns {"text": str, "status": str, "error": str}.
+    """
+    import httpx, re
+    _HEADERS = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json",
+        "Referer": "https://www.toutiao.com/",
+    }
+
+    def _get_article_text(group_id: str) -> str:
+        """Get article text via m.toutiao.com mobile API."""
+        try:
+            r = httpx.get(f"https://m.toutiao.com/i{group_id}/info/",
+                          timeout=10, headers=_HEADERS)
+            data = r.json()
+            if not data.get("success") or not data.get("data"):
+                return ""
+            raw_content = data["data"].get("content", "")
+            if not raw_content:
+                return data["data"].get("abstract", "") or data["data"].get("title", "")
+            # Strip HTML tags, keep text
+            text = re.sub(r'<[^>]+>', ' ', raw_content)
+            text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<')
+            text = text.replace('&gt;', '>').replace('&quot;', '"').replace('&#39;', "'")
+            text = re.sub(r'&#\d+;', '', text)
+            text = re.sub(r'&\w+;', '', text)
+            text = re.sub(r'\s+', ' ', text).strip()
+            # Remove common video placeholder text
+            text = re.sub(r'视频加载中\.{0,3}\s*', '', text).strip()
+            return text
+        except Exception:
+            return ""
+
+    try:
+        url_lower = url.lower()
+
+        # ── Pattern 1: /trending/{topic_id}/ → fetch article list first ──
+        trending_match = re.search(r'/trending/(\d+)', url)
+        if trending_match:
+            topic_id = trending_match.group(1)
+            # Try to get articles under this trending topic
+            r = httpx.get(f"https://www.toutiao.com/api/pc/feed/?tag=event_{topic_id}",
+                          timeout=10, headers=_HEADERS)
+            feed_data = r.json()
+            articles = feed_data.get("data", [])
+
+            # Also try direct mobile API with topic_id (sometimes works)
+            direct_text = _get_article_text(topic_id)
+
+            if articles:
+                # Collect text from top articles (prefer non-video, longer content)
+                collected = []
+                if direct_text and len(direct_text) > 50:
+                    collected.append(direct_text)
+                for art in articles[:6]:
+                    gid = str(art.get("group_id") or art.get("item_id") or "")
+                    if not gid:
+                        continue
+                    text = _get_article_text(gid)
+                    if text and len(text) > 30:
+                        title = art.get("title", "")
+                        source = art.get("source", "")
+                        entry = f"【{title}】({source})\n{text}" if title else text
+                        collected.append(entry)
+                    if len(collected) >= 3:
+                        break
+
+                if collected:
+                    full_text = "\n\n---\n\n".join(collected)
+                    if len(full_text) > 6000:
+                        full_text = full_text[:6000]
+                    return {"text": full_text, "status": "ok", "error": ""}
+
+            # Fallback: if direct_text worked
+            if direct_text and len(direct_text) > 30:
+                return {"text": direct_text, "status": "ok", "error": ""}
+
+            return {"text": "", "status": "empty",
+                    "error": f"toutiao trending topic {topic_id}: no article content found"}
+
+        # ── Pattern 2: /article/{id} or /group/{id}/ → direct mobile API ──
+        art_match = re.search(r'/(?:article|group|a)/(\d+)', url)
+        if art_match:
+            art_id = art_match.group(1)
+            text = _get_article_text(art_id)
+            if text and len(text) > 30:
+                return {"text": text, "status": "ok", "error": ""}
+            return {"text": "", "status": "empty",
+                    "error": f"toutiao article {art_id}: no content or too short"}
+
+        # ── Pattern 3: Unknown toutiao URL pattern ──
+        return {"text": "", "status": "empty", "error": "toutiao URL pattern not recognized"}
+
+    except httpx.TimeoutException:
+        return {"text": "", "status": "timeout", "error": "toutiao API timeout"}
+    except Exception as e:
+        return {"text": "", "status": "error", "error": f"toutiao fetch error: {str(e)[:200]}"}
+
+
+def _fetch_page_text_from_url(url: str) -> dict:
+    """Fetch and extract text content from a URL. Returns {"text": str, "status": str, "error": str}."""
+    import httpx, re
+    if _is_private_or_invalid_url(url):
+        return {"text": "", "status": "error", "error": "private URL blocked"}
+
+    # ── Toutiao: use dedicated mobile API instead of HTTP scraping ──
+    url_lower = url.lower()
+    if 'toutiao.com' in url_lower and 'toutiaocdn.com' not in url_lower:
+        return _fetch_toutiao_content(url)
+
+    # ── Skip URLs that are known to not have article content ──
+    _SKIP_URL_PATTERNS = [
+        'baidu.com/s?', 'so.com/s?', 'sogou.com/web?',       # search result pages
+        'google.com/search', 'bing.com/search',
+        'passport.', 'login.', 'accounts.',                   # login pages
+        '/search?', '/s?wd=',                                 # search queries
+    ]
+    # Sites that require JS rendering — HTTP GET returns no real content
+    # Note: toutiao.com is handled separately via _fetch_toutiao_content() above
+    _JS_ONLY_DOMAINS = [
+        'weibo.com', 'm.weibo.cn',                            # Sina Weibo
+        'bilibili.com', 'b23.tv',                             # Bilibili
+        'zhihu.com',                                          # Zhihu
+        'toutiaocdn.com',                                     # Toutiao CDN (images/assets)
+        'douyin.com',                                         # Douyin
+        'xiaohongshu.com', 'xhslink.com',                    # Xiaohongshu
+        'mp.weixin.qq.com',                                   # WeChat articles (anti-scrape)
+    ]
+    for pat in _SKIP_URL_PATTERNS:
+        if pat in url_lower:
+            return {"text": "", "status": "empty", "error": f"skipped: {pat} URL"}
+    for domain in _JS_ONLY_DOMAINS:
+        if domain in url_lower:
+            return {"text": "", "status": "empty", "error": f"JS-only site: {domain}"}
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://www.google.com/",
+        }
+        r = httpx.get(url, timeout=12, follow_redirects=True, headers=headers)
+        final_url = str(r.url)
+        if _is_private_or_invalid_url(final_url):
+            return {"text": "", "status": "error", "error": "redirect to private address"}
+        html = r.text[:2 * 1024 * 1024]
+
+        # ── 1. Try to extract from <article> or known content containers first ──
+        article_text = ""
+        from html.parser import HTMLParser
+        # Try BS4-like extraction with regex for article/main content
+        article_match = re.search(
+            r'<article[^>]*>(.*?)</article>',
+            html, flags=re.DOTALL | re.IGNORECASE
+        )
+        if not article_match:
+            # Try common content selectors
+            for pattern in [
+                r'<div[^>]*class="[^"]*(?:article[_-]?content|post[_-]?content|entry[_-]?content|rich[_-]?content|content[_-]?body|main[_-]?content|post[_-]?body|text[_-]?content)[^"]*"[^>]*>(.*?)</div>',
+                r'<div[^>]*id="(?:article|content|post|main)[_-]?(?:content|body|text|detail)"[^>]*>(.*?)</div>',
+                r'<main[^>]*>(.*?)</main>',
+            ]:
+                m = re.search(pattern, html, flags=re.DOTALL | re.IGNORECASE)
+                if m:
+                    article_match = m
+                    break
+
+        target_html = article_match.group(1) if article_match else html
+
+        # ── 2. Strip non-content tags ──
+        for tag in ['script', 'style', 'nav', 'header', 'footer', 'aside',
+                     'noscript', 'svg', 'iframe', 'form', 'button', 'input',
+                     'select', 'textarea', 'label']:
+            target_html = re.sub(
+                r'<' + tag + r'[^>]*>.*?</' + tag + r'>',
+                '', target_html, flags=re.DOTALL | re.IGNORECASE
+            )
+        # Strip self-closing / void tags that may contain noise
+        target_html = re.sub(r'<(?:img|br|hr|meta|link|input)[^>]*/?\s*>', '', target_html, flags=re.IGNORECASE)
+
+        # ── 3. Convert HTML to text ──
+        # Preserve paragraph boundaries
+        target_html = re.sub(r'</(?:p|div|h[1-6]|li|tr|blockquote|section)>', '\n\n', target_html, flags=re.IGNORECASE)
+        target_html = re.sub(r'<br\s*/?\s*>', '\n', target_html, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', target_html)
+        # Decode common HTML entities
+        text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"').replace('&#39;', "'")
+        text = re.sub(r'&#\d+;', '', text)
+        text = re.sub(r'&\w+;', '', text)
+        # Clean whitespace
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n[ \t]+', '\n', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        # ── 4. Filter lines ──
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+
+        # Known boilerplate/anti-scrape patterns to remove
+        _JUNK_PATTERNS = [
+            '知乎，让每一次点击都充满意义',
+            '欢迎来到知乎，发现问题背后的世界',
+            '登录后你可以', '下载知乎客户端',
+            'Sina Visitor System', '新浪访客系统',
+            '网络不给力，请稍后重试', '请稍后再试',
+            '百度搜索', '百度一下', '百度首页',
+            '使用百度前必读', '意见反馈',
+            '请输入验证码', '滑动验证', '安全验证',
+            'Access Denied', 'Forbidden', '403 Forbidden',
+            'Just a moment', 'Checking your browser', 'Enable JavaScript',
+            'Please enable cookies', 'please wait',
+            '微博-随时随地发现新鲜事', '请先登录微博',
+            'bilibili.com', '哔哩哔哩',
+            '©', 'Copyright', 'All Rights Reserved',
+            'cookie', 'Cookie', '隐私政策', '服务协议', '用户协议',
+            '关于我们', '联系我们', '意见反馈', '举报',
+            '分享到微信', '分享到朋友圈', '分享到QQ',
+            '免责声明', '版权所有', '备案号',
+        ]
+        def is_junk_line(line):
+            if len(line) < 6:
+                return True
+            for jp in _JUNK_PATTERNS:
+                if jp in line:
+                    return True
+            # Pure URL line
+            if re.match(r'^https?://', line):
+                return True
+            # Navigation-style short fragments (e.g. "首页 发现 关注 消息")
+            if len(line) < 20 and line.count(' ') >= 3:
+                return True
+            return False
+
+        content_lines = [l for l in lines if not is_junk_line(l)]
+
+        # ── 5. Deduplicate (preserve order) ──
+        seen = set()
+        deduped = []
+        for l in content_lines:
+            # Normalize for dedup comparison
+            key = re.sub(r'\s+', '', l)[:80]
+            if key not in seen:
+                seen.add(key)
+                deduped.append(l)
+        content_lines = deduped
+
+        # ── 6. Quality check: detect anti-scrape / boilerplate pages ──
+        full_text = '\n'.join(content_lines)
+        # If total content is too short after cleaning, mark as empty
+        if len(full_text) < 30:
+            return {"text": "", "status": "empty", "error": "content too short after filtering"}
+
+        # If most lines are very short (nav/menu fragments), likely not article
+        if len(content_lines) > 5:
+            short_lines = sum(1 for l in content_lines if len(l) < 15)
+            if short_lines / len(content_lines) > 0.7:
+                return {"text": "", "status": "empty", "error": "mostly short fragments, likely not article content"}
+
+        # ── 7. Truncate to reasonable display length ──
+        text = '\n\n'.join(content_lines[:80])
+        if len(text) > 6000:
+            text = text[:6000]
+
+        return {"text": text, "status": "ok", "error": ""}
+    except httpx.TimeoutException:
+        return {"text": "", "status": "timeout", "error": "request timeout"}
+    except Exception as e:
+        return {"text": "", "status": "error", "error": str(e)[:200]}
+
+
+def _fetch_and_cache_page_text(url: str) -> dict:
+    """Fetch page text and save to cache. Returns result dict."""
+    result = _fetch_page_text_from_url(url)
+    _save_page_text(url, result["text"], result["status"], result.get("error", ""))
+    return result
 
 
 def _generate_brief_llm(title: str, url: str = "") -> dict:
@@ -633,6 +1597,7 @@ def _send_feishu_notification(title: str, content: str):
 
 def _launch_analysis_job(topic: str, context: str = "") -> str:
     """Shared function to launch a multi-model analysis job with progress tracking."""
+    _cleanup_old_jobs()
     job_id = f"analysis_{int(datetime.now().timestamp())}"
     progress = {}
     project_id = _create_project(topic)
@@ -670,7 +1635,7 @@ def _launch_analysis_job(topic: str, context: str = "") -> str:
                 f"**总洞察数**: {rd.get('total_insights', 0)}\n"
                 f"**共识观点**: {len(rd.get('consensus_points', []))} 个\n"
                 f"**分歧观点**: {len(rd.get('disagreement_points', []))} 个\n\n"
-                f"🔗 [查看详情](http://localhost:9090)",
+                f"🔗 [查看详情]({os.environ.get('DASHBOARD_URL', 'https://content.orbitlogic.dev')})",
             )
             # 自动进入写文章阶段（全自动 pipeline）
             if rd.get('total_insights', 0) >= 5:
@@ -719,6 +1684,13 @@ def _auto_generate_article(analysis_file: str, project_id: int, topic: str):
                         break
 
             result = generate_article(analysis, selected_indexes=selected or None)
+
+            # 生成配图并嵌入文章
+            updated_content, img_results = _generate_and_embed_images(result["content"])
+            result["content"] = updated_content
+            if img_results:
+                result["images"] = [i for i in img_results if "filename" in i]
+
             article_path = save_article(result)  # Uses default output dir
 
             _running_jobs[job_id] = {
@@ -730,11 +1702,12 @@ def _auto_generate_article(analysis_file: str, project_id: int, topic: str):
             _add_project_event(project_id, "article_auto_generated",
                                f"自��生成文章: {result.get('title','')} ({result.get('word_count',0)}字)")
 
-            # 自动启动审核
-            _auto_review_article(article_path, project_id, topic)
+            # 不再自动启动审核 — 留给用户手动点击"发起机审"按钮
+            # _auto_review_article(article_path, project_id, topic)
 
         except Exception as e:
             _running_jobs[job_id] = {"status": "error", "error": str(e), "topic": topic}
+            _update_project(project_id, stage="failed")
             _add_project_event(project_id, "article_gen_failed", f"自动写文章失败: {str(e)[:200]}")
             print(f"[Auto-Article] Error for {topic[:30]}: {e}")
 
@@ -771,8 +1744,9 @@ def _auto_review_article(article_file: str, project_id: int, topic: str):
                                f"AI审核完成: {score}分/{verdict}")
 
             # 高分自动推进，低分自动修订，中间留给人审
+            # 阈值 9.0: 只有真正高分才跳过人审，8.x 都进人审让用户把关
             revise_count = _count_project_events(project_id, "auto_revision_done")
-            if verdict == "publish" and score >= 8.0:
+            if verdict == "publish" and score >= 9.0:
                 _update_project(project_id, stage="ready")
                 _add_project_event(project_id, "auto_approved",
                                    f"高分自动通过: {score}分/{verdict} → 待发布")
@@ -978,14 +1952,62 @@ def _get_topic_hits(week_start=None):
         conn.close()
 
 
+def _get_topic_trends(top_n=10):
+    """返回 Top N 事件的每日文章数分布，用于热度趋势图。"""
+    conn = sqlite3.connect(WORKFLOW_DB)
+    conn.row_factory = sqlite3.Row
+    try:
+        # 按文章数排名取 Top N 事件
+        events = conn.execute("""
+            SELECT id, event_name, event_key, lifecycle_stage, total_articles,
+                   start_date, updated_at
+            FROM topic_events
+            ORDER BY total_articles DESC, updated_at DESC
+            LIMIT ?
+        """, (top_n,)).fetchall()
+
+        result = []
+        for ev in events:
+            # 获取该事件每天的文章数
+            daily = conn.execute("""
+                SELECT data_date, COUNT(*) as count, GROUP_CONCAT(source, '|') as sources
+                FROM event_articles
+                WHERE event_id = ?
+                GROUP BY data_date
+                ORDER BY data_date
+            """, (ev["id"],)).fetchall()
+
+            result.append({
+                "event_name": ev["event_name"],
+                "lifecycle_stage": ev["lifecycle_stage"],
+                "total_articles": ev["total_articles"],
+                "start_date": ev["start_date"],
+                "daily_trend": [
+                    {"date": d["data_date"], "count": d["count"],
+                     "sources": list(set(d["sources"].split("|"))) if d["sources"] else []}
+                    for d in daily
+                ],
+            })
+        return result
+    finally:
+        conn.close()
+
+
 def _get_recommendations():
     try:
         from article.topic_detector import get_cached_recommendations
         data = get_cached_recommendations()
         recs = data.get("recommendations", [])
         filtered = [r for r in recs if r.get("topic_title", "") not in _skipped_topics]
+        # 标注待审批状态
+        for r in filtered:
+            t = r.get("topic_title", "")
+            if t in _pending_approvals:
+                r["pending_approval"] = True
+                r["pending_since"] = _pending_approvals[t].get("added_time", "")
         data["recommendations"] = filtered
         data["count"] = len(filtered)
+        data["pending_count"] = len(_pending_approvals)
         return data
     except Exception as e:
         return {"recommendations": [], "scan_time": 0, "count": 0, "error": str(e)}
@@ -1015,6 +2037,57 @@ def _analytics_competitors():
         return {"error": str(e)}
 
 
+def _competitors_timeline(params):
+    try:
+        from article.analytics import get_competitor_timeline
+        days = int(params.get("days", ["14"])[0])
+        return get_competitor_timeline(days=days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _competitors_topic_stats(params):
+    try:
+        from article.analytics import get_competitor_topic_stats
+        days = int(params.get("days", ["30"])[0])
+        return get_competitor_topic_stats(days=days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _competitors_cadence(params):
+    try:
+        from article.analytics import get_publishing_cadence
+        days = int(params.get("days", ["30"])[0])
+        return get_publishing_cadence(days=days)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _competitors_coverage():
+    try:
+        from article.analytics import get_coverage_comparison
+        return get_coverage_comparison()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _competitors_insights():
+    try:
+        from article.analytics import get_latest_insights
+        return get_latest_insights()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _competitors_scan_status():
+    try:
+        from article.analytics import get_scan_status
+        return get_scan_status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _get_templates():
     try:
         from article.formatter import get_templates
@@ -1028,8 +2101,21 @@ def _get_templates():
         ]
 
 
+_analyses_cache: dict = {}  # {"result": [...], "ts": float}
+_ANALYSES_CACHE_TTL = 3  # seconds – avoid repeated reads during rapid UI reloads
+
+
 def list_analyses():
-    """List saved analysis files, enriched with workflow stage."""
+    """List saved analysis files, enriched with workflow stage.
+
+    Performance: single batch DB query + dict lookup (was N queries).
+    Results are cached for 3 s to handle rapid UI reloads.
+    """
+    now = time.time()
+    cached = _analyses_cache
+    if cached.get("result") is not None and now - cached.get("ts", 0) < _ANALYSES_CACHE_TTL:
+        return cached["result"]
+
     if not os.path.isdir(ANALYSIS_STORE):
         return []
     files = glob.glob(os.path.join(ANALYSIS_STORE, "*.json"))
@@ -1039,10 +2125,29 @@ def list_analyses():
         if not os.path.basename(f).startswith(("source_verification_", "article_picks", "today_suggestions"))
         and not f.endswith(".verification.json")
     ]
+
+    # ── 一次性加载所有 project 行，构建路径 → project 字典 ──
     conn = _workflow_conn()
     conn.row_factory = sqlite3.Row
+    all_projs = conn.execute("SELECT id, stage, analysis_file FROM projects").fetchall()
+    conn.close()
+
+    path_lookup: dict = {}      # exact analysis_file → row
+    realpath_lookup: dict = {}   # realpath(analysis_file) → row
+    basename_lookup: dict = {}   # basename → row (fallback for different mount paths)
+    for p in all_projs:
+        af = p["analysis_file"]
+        if af:
+            path_lookup[af] = p
+            basename_lookup[os.path.basename(af)] = p
+            try:
+                realpath_lookup[os.path.realpath(af)] = p
+            except Exception:
+                pass
+
     results = []
-    for f in sorted(files, key=os.path.getmtime, reverse=True)[:20]:
+    seen_files = set()  # 跟踪已处理的文件 basename，用于后续 DB 补漏
+    for f in sorted(files, key=os.path.getmtime, reverse=True):
         try:
             with open(f, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -1052,18 +2157,14 @@ def list_analyses():
             total = data.get("total_insights", 0) or 0
             succeeded = data.get("models_succeeded", 0) or 0
             topic = data.get("topic", "")
-            # 用 realpath 匹配，因为 analysis_file 可能有不同的相对路径写法
-            real_f = os.path.realpath(f)
-            proj = conn.execute(
-                "SELECT id, stage FROM projects WHERE analysis_file = ? LIMIT 1", (f,)
-            ).fetchone()
+
+            # 匹配 project：先精确路径，再 realpath，再 basename（容器内不同挂载点）
+            proj = path_lookup.get(f)
             if not proj:
-                # 尝试 realpath 匹配：遍历所有 projects 的 analysis_file
-                all_projs = conn.execute("SELECT id, stage, analysis_file FROM projects").fetchall()
-                for p in all_projs:
-                    if p["analysis_file"] and os.path.realpath(p["analysis_file"]) == real_f:
-                        proj = p
-                        break
+                proj = realpath_lookup.get(os.path.realpath(f))
+            if not proj:
+                proj = basename_lookup.get(os.path.basename(f))
+
             stage = "insights" if total > 0 else ("failed" if succeeded == 0 else "analysis")
             project_id = None
             if proj:
@@ -1078,9 +2179,43 @@ def list_analyses():
                 "stage": stage,
                 "project_id": project_id,
             })
+            seen_files.add(os.path.basename(f))
         except Exception:
             pass
-    conn.close()
+
+    # ── DB 补漏：确保所有有 analysis_file 的项目都出现 ──
+    # 处理文件路径不在当前扫描目录（路径不匹配/已移动）的情况
+    for p in all_projs:
+        af = p["analysis_file"]
+        if not af:
+            continue
+        bn = os.path.basename(af)
+        if bn in seen_files:
+            continue  # 已通过文件扫描加入
+        # 尝试在 ANALYSIS_STORE 下查找
+        candidate = os.path.join(ANALYSIS_STORE, bn)
+        if not os.path.isfile(candidate):
+            continue
+        try:
+            with open(candidate, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if not data.get("model_results"):
+                continue
+            results.append({
+                "file": candidate,
+                "topic": data.get("topic", ""),
+                "total_insights": data.get("total_insights", 0) or 0,
+                "models_succeeded": data.get("models_succeeded", 0) or 0,
+                "timestamp": data.get("timestamp", 0),
+                "stage": p["stage"],
+                "project_id": p["id"],
+            })
+            seen_files.add(bn)
+        except Exception:
+            pass
+
+    _analyses_cache["result"] = results
+    _analyses_cache["ts"] = now
     return results
 
 
@@ -1133,6 +2268,34 @@ ANALYSIS_STORE = os.path.join(CE_ROOT, "content-data", "analysis")
 ARTICLES_STORE = os.path.join(CE_ROOT, "content-data", "articles")
 
 _running_jobs = {}
+_RUNNING_JOBS_MAX_AGE = 3600 * 2   # Stage 2: 6h → 2h（更激进，避免长跑泄漏）
+_RUNNING_JOBS_MAX_COUNT = 100       # Stage 2: 200 → 100
+
+
+def _cleanup_old_jobs():
+    """Remove completed/failed jobs older than _RUNNING_JOBS_MAX_AGE, keep recent ones."""
+    if len(_running_jobs) < 10:
+        return  # Stage 2: 20 → 10，更早开始 GC
+    now = time.time()
+    to_remove = []
+    for jid, jdata in _running_jobs.items():
+        if jdata.get("status") in ("done", "error"):
+            start_str = jdata.get("start_time", "")
+            try:
+                start_ts = datetime.fromisoformat(start_str).timestamp() if start_str else 0
+            except Exception:
+                start_ts = 0
+            if now - start_ts > _RUNNING_JOBS_MAX_AGE:
+                to_remove.append(jid)
+    for jid in to_remove:
+        _running_jobs.pop(jid, None)
+    # Hard cap: if still too many, remove oldest completed first
+    if len(_running_jobs) > _RUNNING_JOBS_MAX_COUNT:
+        completed = [(jid, jdata) for jid, jdata in _running_jobs.items()
+                     if jdata.get("status") in ("done", "error")]
+        completed.sort(key=lambda x: x[1].get("start_time", ""))
+        for jid, _ in completed[:len(_running_jobs) - _RUNNING_JOBS_MAX_COUNT]:
+            _running_jobs.pop(jid, None)
 
 
 def _reparse_failed_insights(data: dict, fpath: str) -> dict:
@@ -1186,17 +2349,151 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DASHBOARD_DIR, **kwargs)
 
+    # --- security helpers (stage 1, 2026-05-12) ---
+
+    def _cors_origin(self):
+        """根据请求 Origin 决定回写哪个 CORS 域。仅白名单允许；否则不发 CORS 头。"""
+        origin = self.headers.get("Origin", "")
+        if origin and origin in _ALLOWED_ORIGINS:
+            return origin
+        return ""
+
+    def _send_security_headers(self):
+        """调用必须在 send_response 之后、end_headers 之前。"""
+        self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' https://browser.sentry-cdn.com https://js.sentry-cdn.com; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
+            "connect-src 'self' https:; "
+            "worker-src 'self' blob:; "
+            "frame-src https:; "
+            "frame-ancestors 'none'"
+        )
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+
+    def _send_error_json(self, status: int, message: str, extra_headers=None):
+        body = json.dumps({"error": message}).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _rate_ok(self, path: str) -> bool:
+        """Stage 2 rate limit. client_id 优先用 Authorization 头，回退到 IP。"""
+        cid = self.headers.get("Authorization", "") or (self.client_address[0] if self.client_address else "anon")
+        if not _rate_allow(cid, path):
+            self._send_error_json(429, "rate limit exceeded — please slow down")
+            return False
+        return True
+
+    def _audit_actor(self) -> str:
+        """提取操作者标识（供审计日志使用）。"""
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            return "bearer:" + auth[7:][:8] + "..."
+        if auth.startswith("Basic "):
+            try:
+                decoded = _b64.b64decode(auth[6:]).decode("utf-8", "replace")
+                user, _, _ = decoded.partition(":")
+                return f"basic:{user}"
+            except Exception:
+                return "basic:?"
+        return (self.client_address[0] if self.client_address else "anon")
+
+    def _current_user(self):
+        """返回当前请求的用户名（如果已鉴权）。检查顺序：cookie session → Bearer → Basic。"""
+        # 1. Cookie session（浏览器交互入口）
+        cookies = _parse_cookies(self.headers.get("Cookie", ""))
+        tok = cookies.get(_SESSION_COOKIE)
+        if tok:
+            user = _session_valid(tok)
+            if user:
+                return user
+        # 2. Bearer / Basic（API 客户端入口）
+        auth = self.headers.get("Authorization", "")
+        if _BEARER_TOKEN and auth.startswith("Bearer "):
+            try:
+                if _hmac.compare_digest(auth[7:].strip(), _BEARER_TOKEN):
+                    return "bearer-client"
+            except Exception:
+                pass
+        if _AUTH_USER and _AUTH_PASSWORD and auth.startswith("Basic "):
+            try:
+                decoded = _b64.b64decode(auth[6:]).decode("utf-8", "replace")
+                user, _, pwd = decoded.partition(":")
+                if _hmac.compare_digest(user, _AUTH_USER) and _hmac.compare_digest(pwd, _AUTH_PASSWORD):
+                    return user
+            except Exception:
+                pass
+        return None
+
+    def _require_auth(self) -> bool:
+        """检查 /api/* 鉴权。通过返回 True；否则自动发 401/503 并返回 False。
+        如果服务器未配置任何认证，默认放行（依赖 Traefik / 网络层安全）。"""
+        if not _AUTH_CONFIGURED:
+            return True
+        if self._current_user():
+            return True
+        # 重要：不再回写 WWW-Authenticate，避免浏览器对 fetch 弹 Basic 框
+        # 浏览器前端 JS 收到 401 后自行显示登录页。curl/Bearer 客户端不依赖此头。
+        self._send_error_json(401, "authentication required")
+        return False
+
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self._send_security_headers()
+        if self._cors_origin():
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-CSRF-Token")
+            self.send_header("Access-Control-Max-Age", "600")
         self.end_headers()
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        length = int(self.headers.get("Content-Length", 0))
+
+        # 全局鉴权 + 速率限制：所有 /api/* 必须带凭证 + 不超速
+        # /api/login 是登录入口，跳过鉴权但仍走 rate limit（防暴力破解）
+        if path.startswith("/api/"):
+            if path != "/api/login":
+                if not self._require_auth():
+                    return
+                # CSRF 校验：仅对 cookie session 用户（浏览器入口）强制检查
+                # Bearer/Basic 认证的 API 客户端不需要 CSRF token
+                if _AUTH_CONFIGURED:
+                    cookies = _parse_cookies(self.headers.get("Cookie", ""))
+                    sess_tok = cookies.get(_SESSION_COOKIE)
+                    if sess_tok and _session_valid(sess_tok):
+                        csrf_hdr = self.headers.get("X-CSRF-Token", "")
+                        if not _csrf_validate(sess_tok, csrf_hdr):
+                            self._send_error_json(403, "CSRF token invalid or missing")
+                            return
+            if not self._rate_ok(path):
+                return
+
+        # 请求体大小限制
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        if length < 0 or length > _MAX_BODY_SIZE:
+            self._send_error_json(413, f"request body too large (max {_MAX_BODY_SIZE} bytes)")
+            return
         body = {}
         if length > 0:
             raw = self.rfile.read(length)
@@ -1223,6 +2520,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._add_competitor(body)
         elif path == "/api/add-competitor-article":
             self._add_competitor_article(body)
+        elif path == "/api/competitors/scan":
+            self._scan_competitors(body)
+        elif path == "/api/competitors/seed":
+            self._seed_competitors(body)
+        elif path == "/api/competitors/set-rss":
+            self._set_competitor_rss(body)
+        elif path == "/api/competitors/delete":
+            self._delete_competitor(body)
         elif path == "/api/repurpose":
             self._repurpose(body)
         elif path == "/api/generate-comments":
@@ -1243,14 +2548,101 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._video_script_from_article(body)
         elif path == "/api/project/update-stage":
             self._update_project_stage(body)
+        elif path == "/api/verify-console":
+            pwd = body.get("password", "")
+            if not _CONSOLE_PASSWORD:
+                self._json({"success": False, "error": "Console password not configured on server"})
+            elif _hmac.compare_digest(pwd, _CONSOLE_PASSWORD):
+                self._json({"success": True})
+            else:
+                self._json({"success": False, "error": "Invalid password"})
         elif path == "/api/save-api-keys":
             self._save_api_keys(body)
         elif path == "/api/generate-brief":
             self._generate_brief(body)
         elif path == "/api/generate-briefs-batch":
             self._generate_briefs_batch(body)
+        elif path == "/api/translate":
+            self._translate(body)
+        elif path == "/api/generate-article-images":
+            self._generate_article_images(body)
+        elif path == "/api/image-models":
+            self._list_image_models()
+        elif path == "/api/generate-image-preview":
+            self._generate_image_preview(body)
+        elif path == "/api/extract-image-placeholders":
+            self._extract_image_placeholders(body)
+        elif path == "/api/fetch-page-texts-batch":
+            self._fetch_page_texts_batch(body)
+        elif path == "/api/article-structure":
+            self._analyze_article_structure(body)
+        elif path == "/api/login":
+            self._handle_login(body)
+        elif path == "/api/logout":
+            self._handle_logout(body)
         else:
             self.send_error(404)
+
+    def _handle_login(self, body):
+        """Cookie session login (Stage 2.5)."""
+        ip = self.client_address[0] if self.client_address else "0.0.0.0"
+        allowed, wait_secs = _login_check(ip)
+        if not allowed:
+            _audit("anon", "auth.login_blocked", target=ip, detail=f"locked {wait_secs}s")
+            self._send_error_json(429, f"too many login attempts, try again in {wait_secs} seconds")
+            return
+        user = (body.get("user") or "").strip()
+        pwd = (body.get("password") or "")
+        if not user or not pwd:
+            self._send_error_json(400, "user and password required")
+            return
+        if not (_AUTH_USER and _AUTH_PASSWORD):
+            self._send_error_json(503, "auth not configured on server")
+            return
+        try:
+            ok = _hmac.compare_digest(user, _AUTH_USER) and _hmac.compare_digest(pwd, _AUTH_PASSWORD)
+        except Exception:
+            ok = False
+        if not ok:
+            _login_record_failure(ip)
+            _audit("anon", "auth.login_failed", target=user[:32],
+                   detail=ip)
+            time.sleep(0.3)  # 简单防暴力：失败 300ms 延迟
+            self._send_error_json(401, "invalid credentials")
+            return
+        _login_reset(ip)
+        token = _session_create(user)
+        body_out = json.dumps({"success": True, "user": user, "expires_in": _SESSION_LIFETIME}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_out)))
+        # HttpOnly: 防 XSS 读取 cookie；Secure: 仅 HTTPS；SameSite=Lax: 防 CSRF
+        self.send_header(
+            "Set-Cookie",
+            f"{_SESSION_COOKIE}={token}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age={_SESSION_LIFETIME}"
+        )
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(body_out)
+        _audit(user, "auth.login_ok")
+
+    def _handle_logout(self, body):
+        """Revoke current session cookie."""
+        cookies = _parse_cookies(self.headers.get("Cookie", ""))
+        tok = cookies.get(_SESSION_COOKIE)
+        if tok:
+            _session_revoke(tok)
+        body_out = b'{"success": true}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body_out)))
+        self.send_header(
+            "Set-Cookie",
+            f"{_SESSION_COOKIE}=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0"
+        )
+        self._send_security_headers()
+        self.end_headers()
+        self.wfile.write(body_out)
 
     def _generate_brief(self, body):
         """Generate a brief for a single news item."""
@@ -1292,16 +2684,28 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         def run():
             done = 0
+            errors = 0
+            last_model = ""
             for it in to_generate:
                 t = it.get("title", "")
                 u = it.get("url", "")
                 if not t:
                     continue
-                r = _generate_and_cache_brief(t, u)
-                done += 1
-                if "brief" in r:
-                    _running_jobs[job_id]["results"][t] = r["brief"]
+                try:
+                    r = _generate_and_cache_brief(t, u)
+                    done += 1
+                    if "brief" in r:
+                        _running_jobs[job_id]["results"][t] = r["brief"]
+                        last_model = r.get("model", last_model)
+                    else:
+                        errors += 1
+                except Exception as e:
+                    done += 1
+                    errors += 1
+                    print(f"[Brief Batch] Error for '{t[:30]}': {e}")
                 _running_jobs[job_id]["done"] = done
+                _running_jobs[job_id]["errors"] = errors
+                _running_jobs[job_id]["model"] = last_model
             _running_jobs[job_id]["status"] = "done"
 
         threading.Thread(target=run, daemon=True).start()
@@ -1311,10 +2715,79 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "cached_briefs": cached,
         })
 
+    def _translate(self, body):
+        """Translate text (typically English) to Chinese."""
+        title = _cap_llm_input(body.get("title", "").strip(), _LLM_TOPIC_MAX)
+        text = _cap_llm_input(body.get("text", "").strip(), _LLM_TEXT_MAX)
+        if not title and not text:
+            self._json({"error": "title or text required"})
+            return
+        content = f"标题：{title}" if title else ""
+        if text:
+            content += f"\n内容：{text}" if content else f"内容：{text}"
+        prompt = (
+            "将以下英文科技资讯翻译为中文，保持专业术语准确，语言自然流畅。"
+            "只输出翻译结果，不要加额外说明。\n\n" + content
+        )
+        import httpx
+        # Try DeepSeek → Gemini → TokenKey
+        ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if ds_key:
+            try:
+                resp = httpx.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                    json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 500, "temperature": 0.3},
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    translated = data["choices"][0]["message"]["content"].strip()
+                    self._json({"translated": translated, "model": "deepseek"})
+                    return
+            except Exception as e:
+                print(f"[Translate] DeepSeek failed: {e}")
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        if gemini_key:
+            try:
+                resp = httpx.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={gemini_key}",
+                    json={"contents": [{"parts": [{"text": prompt}]}],
+                          "generationConfig": {"maxOutputTokens": 500, "temperature": 0.3}},
+                    timeout=20,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    translated = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+                    self._json({"translated": translated, "model": "gemini-flash"})
+                    return
+            except Exception as e:
+                print(f"[Translate] Gemini failed: {e}")
+        tk_key = os.environ.get("TOKENKEY_API_KEY", "")
+        tk_base = os.environ.get("TOKENKEY_API_BASE", "https://api.tokenkey.dev/v1")
+        if tk_key:
+            try:
+                resp = httpx.post(
+                    f"{tk_base}/chat/completions",
+                    headers={"Authorization": f"Bearer {tk_key}", "Content-Type": "application/json"},
+                    json={"model": "claude-sonnet-4-20250514", "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 500, "temperature": 0.3},
+                    timeout=25,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    translated = data["choices"][0]["message"]["content"].strip()
+                    self._json({"translated": translated, "model": "claude-sonnet"})
+                    return
+            except Exception as e:
+                print(f"[Translate] TokenKey failed: {e}")
+        self._json({"error": "所有翻译模型均不可用，请检查 API 配置"})
+
     def _start_analysis(self, body):
         """Start multi-model analysis in background thread."""
-        topic = body.get("topic", "").strip()
-        context = body.get("context", "")
+        topic = _cap_llm_input(body.get("topic", "").strip(), _LLM_TOPIC_MAX)
+        context = _cap_llm_input(body.get("context", ""), _LLM_CONTEXT_MAX)
         if not topic:
             self._json({"error": "topic is required"})
             return
@@ -1352,6 +2825,13 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     with open(analysis_file, "r", encoding="utf-8") as f:
                         analysis = json.load(f)
                 article = generate_article(analysis)
+
+                # 生成配图并嵌入文章
+                updated_content, img_results = _generate_and_embed_images(article["content"])
+                article["content"] = updated_content
+                if img_results:
+                    article["images"] = [i for i in img_results if "filename" in i]
+
                 filepath = save_article(article)
                 _running_jobs[job_id] = {
                     "status": "done",
@@ -1363,7 +2843,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     "project_id": project_id,
                 }
                 if project_id:
-                    _update_project(project_id, stage="review",
+                    # stage 停在 writing — 让用户阅读文章后手动点"发起机审"
+                    _update_project(project_id, stage="writing",
                                     article_file=filepath,
                                     article_title=article.get("title", ""))
                     _add_project_event(project_id, "article_done",
@@ -1373,11 +2854,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                     f"**话题**: {topic}\n"
                     f"**标题**: {article.get('title', '未知')}\n"
                     f"**字数**: {len(article.get('content', ''))}\n\n"
-                    f"🔗 [查看详情](http://localhost:9090)",
+                    f"🔗 [查看详情]({os.environ.get('DASHBOARD_URL', 'https://content.orbitlogic.dev')})",
                 )
             except Exception as e:
                 _running_jobs[job_id] = {"status": "error", "error": str(e), "topic": topic, "project_id": project_id}
                 if project_id:
+                    _update_project(project_id, stage="failed")
                     _add_project_event(project_id, "writing_failed", str(e)[:500])
                 _send_feishu_notification(
                     f"❌ 文章生成失败: {topic}",
@@ -1386,6 +2868,278 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         threading.Thread(target=run, daemon=True).start()
         self._json({"job_id": job_id, "status": "started", "topic": topic})
+
+    def _generate_article_images(self, body):
+        """Generate images for an existing article's [IMAGE: ...] placeholders."""
+        article_file = body.get("article_file", "")
+        project_id = body.get("project_id")
+        if not article_file or not os.path.exists(article_file):
+            self._json({"error": "article_file not found"})
+            return
+
+        job_id = f"imagegen_{int(time.time())}"
+        _running_jobs[job_id] = {"status": "running", "type": "imagegen", "project_id": project_id}
+
+        def run():
+            try:
+                import re as _re
+                with open(article_file, "r", encoding="utf-8") as f:
+                    content = f.read()
+
+                # Check if there are [IMAGE: ...] placeholders
+                placeholders = _re.findall(r'\[IMAGE:\s*[^\]]+\]', content)
+                if not placeholders:
+                    _running_jobs[job_id] = {"status": "done", "type": "imagegen",
+                                             "message": "No [IMAGE:] placeholders found", "images": []}
+                    return
+
+                # Generate images and embed
+                updated_content, img_results = _generate_and_embed_images(content)
+
+                # Write back
+                with open(article_file, "w", encoding="utf-8") as f:
+                    f.write(updated_content)
+
+                successful = [i for i in img_results if "filename" in i]
+                _running_jobs[job_id] = {
+                    "status": "done", "type": "imagegen",
+                    "message": f"Generated {len(successful)} images",
+                    "images": successful, "project_id": project_id,
+                }
+                if project_id:
+                    _add_project_event(project_id, "images_generated",
+                                       f"为文章生成了 {len(successful)} 张配图")
+            except Exception as e:
+                _running_jobs[job_id] = {"status": "error", "error": str(e), "project_id": project_id}
+                print(f"[ImageGen] Error: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+        self._json({"job_id": job_id, "status": "started"})
+
+    def _list_image_models(self):
+        """Return available image generation models."""
+        from article.image_gen import available_models
+        self._json({"models": available_models()})
+
+    def _extract_image_placeholders(self, body):
+        """Extract [IMAGE: ...] placeholders from an article file."""
+        article_file = body.get("article_file", "")
+        if not article_file or not os.path.exists(article_file):
+            self._json({"error": "article_file not found"})
+            return
+        import re as _re
+        with open(article_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        placeholders = _re.findall(r'\[IMAGE:\s*(.+?)\]', content)
+        self._json({"placeholders": placeholders, "count": len(placeholders)})
+
+    def _generate_image_preview(self, body):
+        """Generate a single image preview with custom prompt and model selection.
+        Returns a job_id; poll /api/job to get the result with preview_base64."""
+        prompt = body.get("prompt", "").strip()
+        model = body.get("model", "auto")
+        if not prompt:
+            self._json({"error": "prompt is required"})
+            return
+
+        job_id = f"imgpreview_{int(time.time())}_{hash(prompt) % 10000}"
+        _running_jobs[job_id] = {"status": "running", "type": "imagegen"}
+
+        def run():
+            try:
+                from article.image_gen import generate_image_preview
+                result = generate_image_preview(prompt, model=model)
+                if "error" in result:
+                    _running_jobs[job_id] = {"status": "error", "error": result["error"]}
+                else:
+                    _running_jobs[job_id] = {
+                        "status": "done", "type": "imagegen",
+                        "result": {
+                            "preview_base64": result.get("preview_base64", ""),
+                            "filename": result.get("filename", ""),
+                            "path": result.get("path", ""),
+                            "model": result.get("model", ""),
+                            "generation_time": result.get("generation_time", 0),
+                            "size_bytes": result.get("size_bytes", 0),
+                            "prompt": prompt,
+                        }
+                    }
+            except Exception as e:
+                _running_jobs[job_id] = {"status": "error", "error": str(e)}
+                print(f"[ImagePreview] Error: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+        self._json({"job_id": job_id, "status": "started", "model": model})
+
+    def _analyze_article_structure(self, body):
+        """Analyze article argument structure and logical flow using LLM."""
+        import httpx
+
+        article_file = body.get("file", "")
+        if not article_file:
+            self._send_error_json(400, "file parameter required")
+            return
+
+        # Read article content — resolve path same as article-detail GET
+        fpath = article_file
+        if not os.path.isabs(fpath):
+            fpath = os.path.join(CE_ROOT, fpath)
+        fpath = os.path.realpath(fpath)
+        if not _is_safe_detail_path(fpath) or not os.path.isfile(fpath):
+            self._send_error_json(404, "article file not found")
+            return
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Strip front matter
+        if content.startswith("---"):
+            fm_end = content.index("---", 3) if "---" in content[3:] else -1
+            if fm_end > 0:
+                content = content[fm_end + 3:].strip()
+
+        prompt = f"""你是一位资深编辑。请分析以下文章的论点结构和逻辑链。
+
+要求：
+1. 将文章分成逻辑段落（不是按标题，而是按论点），每段提炼一句核心论点
+2. 分析段落之间的逻辑关系（引出/支撑/递进/转折/对比/举例/总结）
+3. 评估整体逻辑紧凑度（1-10分）
+4. 如果有逻辑薄弱点或"堆砌感"，指出具体位置
+
+请严格用以下 JSON 格式返回（不要加 markdown 代码块标记）：
+{{
+  "sections": [
+    {{
+      "id": 1,
+      "title": "段落概括（5-10字）",
+      "core_point": "这一段的核心论点（一句话）",
+      "relation_to_next": "与下一段的逻辑关系（引出/支撑/递进/转折/对比/举例/总结/无）",
+      "relation_strength": "强/中/弱"
+    }}
+  ],
+  "logic_score": 8,
+  "logic_comment": "整体逻辑评价（1-2句话）",
+  "weak_points": ["薄弱点1描述", "薄弱点2描述"],
+  "flow_summary": "一句话概括全文论证路径，如：提出现象→分析原因→对比案例→得出结论"
+}}
+
+文章内容：
+{content[:12000]}"""
+
+        result = None
+        model_used = ""
+
+        # 1. Try DeepSeek (fast)
+        ds_key = os.environ.get("DEEPSEEK_API_KEY", "")
+        if ds_key:
+            try:
+                resp = httpx.post(
+                    "https://api.deepseek.com/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {ds_key}", "Content-Type": "application/json"},
+                    json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": 2000, "temperature": 0.3},
+                    timeout=30,
+                )
+                if resp.status_code == 200:
+                    text = resp.json()["choices"][0]["message"]["content"].strip()
+                    model_used = "deepseek"
+                    result = text
+            except Exception as e:
+                print(f"[Structure] DeepSeek failed: {e}")
+
+        # 2. Fallback: TokenKey Claude
+        if not result:
+            tk_key = os.environ.get("TOKENKEY_API_KEY", "")
+            tk_base = os.environ.get("TOKENKEY_API_BASE", "https://api.tokenkey.dev/v1")
+            if tk_key:
+                try:
+                    resp = httpx.post(
+                        f"{tk_base}/chat/completions",
+                        headers={"Authorization": f"Bearer {tk_key}", "Content-Type": "application/json"},
+                        json={"model": "claude-sonnet-4-20250514",
+                              "messages": [{"role": "user", "content": prompt}],
+                              "max_tokens": 2000, "temperature": 0.3},
+                        timeout=30,
+                    )
+                    if resp.status_code == 200:
+                        text = resp.json()["choices"][0]["message"]["content"].strip()
+                        model_used = "claude-sonnet"
+                        result = text
+                except Exception as e:
+                    print(f"[Structure] TokenKey failed: {e}")
+
+        if not result:
+            self._send_error_json(500, "所有模型均不可用")
+            return
+
+        # Parse JSON from LLM response
+        import re as _re
+        # Strip markdown code block if present
+        result = _re.sub(r'^```(?:json)?\s*', '', result)
+        result = _re.sub(r'\s*```$', '', result)
+
+        try:
+            parsed = json.loads(result)
+        except json.JSONDecodeError:
+            # Try to find JSON in the response
+            match = _re.search(r'\{[\s\S]*\}', result)
+            if match:
+                try:
+                    parsed = json.loads(match.group())
+                except json.JSONDecodeError:
+                    parsed = {"raw": result, "parse_error": True}
+            else:
+                parsed = {"raw": result, "parse_error": True}
+
+        parsed["model"] = model_used
+        self._json(parsed)
+
+    def _fetch_page_texts_batch(self, body):
+        """Batch fetch and cache page texts for a list of URLs."""
+        urls = body.get("urls", [])
+        if not urls:
+            self._json({"error": "urls list required"})
+            return
+        urls = urls[:80]  # Cap at 80
+
+        # Return already-cached texts immediately
+        cached = _get_cached_page_texts(urls)
+        uncached = [u for u in urls if u not in cached]
+
+        if not uncached:
+            self._json({"cached": len(cached), "fetching": 0, "texts": cached})
+            return
+
+        job_id = f"pagetext_{int(time.time())}"
+        _running_jobs[job_id] = {
+            "status": "running", "type": "pagetext",
+            "total": len(uncached), "done": 0, "texts": {},
+        }
+
+        def run():
+            done = 0
+            for url in uncached:
+                try:
+                    result = _fetch_and_cache_page_text(url)
+                    _running_jobs[job_id]["texts"][url] = {
+                        "text": result["text"][:3000],  # Truncate in job result
+                        "status": result["status"],
+                    }
+                except Exception as e:
+                    _running_jobs[job_id]["texts"][url] = {"text": "", "status": "error"}
+                done += 1
+                _running_jobs[job_id]["done"] = done
+                time.sleep(0.3)  # Throttle
+            _running_jobs[job_id]["status"] = "done"
+            print(f"[PageText] Batch done: {done}/{len(uncached)} fetched")
+
+        threading.Thread(target=run, daemon=True).start()
+        self._json({
+            "job_id": job_id,
+            "cached": len(cached),
+            "fetching": len(uncached),
+            "texts": cached,
+        })
 
     def _start_review(self, body):
         """Review an article."""
@@ -1547,14 +3301,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                         article_md_path=article_file,
                         app_id=wechat_cfg["app_id"],
                         app_secret=wechat_cfg["app_secret"],
-                        author=wechat_cfg.get("author", ""),
+                        author=wechat_cfg.get("author", "蔚满漫行记"),
                         thumb_media_id=wechat_cfg.get("default_thumb_media_id", ""),
                         dry_run=dry_run,
+                        draft_only=True,  # 个人订阅号无 freepublish 权限，推到草稿箱
                     )
                     if not dry_run and project_id:
                         _update_project(int(project_id), stage="published")
                         _add_project_event(int(project_id), "published",
-                                           f"已发布到微信公众号: {result.get('article_url', '')}")
+                                           f"已推送到微信草稿箱: {result.get('draft_media_id', '')}")
+                    if not dry_run:
+                        _audit(self._audit_actor(), "article.publish", target=str(project_id or title)[:120],
+                               detail=f"platform=wechat draft={result.get('draft_media_id','')}")
                     self._json({"success": True, "platform": "wechat", **result})
                     return
 
@@ -1577,10 +3335,20 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 "hint": "微信凭据未配置，仅记录发布。配置 config.yaml wechat.app_id/app_secret 后可直接推送。",
             })
         except Exception as e:
-            self._json({"error": str(e)})
+            self._json({"error": _safe_err(e)})
 
     def _load_wechat_config(self):
-        """Load WeChat config from content-engine/config.yaml."""
+        """Load WeChat config from env vars (preferred) or content-engine/config.yaml."""
+        # Env vars take priority (more secure, no secrets in image)
+        env_cfg = {
+            "app_id": os.environ.get("WECHAT_APP_ID", ""),
+            "app_secret": os.environ.get("WECHAT_APP_SECRET", ""),
+            "default_thumb_media_id": os.environ.get("WECHAT_THUMB_MEDIA_ID", ""),
+            "author": os.environ.get("WECHAT_AUTHOR", ""),
+        }
+        if env_cfg["app_id"] and env_cfg["app_secret"]:
+            return env_cfg
+        # Fallback to config.yaml
         try:
             import yaml
             cfg_path = os.path.join(CE_ROOT, "config.yaml")
@@ -1610,7 +3378,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             )
             self._json({"success": True})
         except Exception as e:
-            self._json({"error": str(e)})
+            self._json({"error": _safe_err(e)})
 
     def _add_competitor(self, body):
         """Add a competitor account."""
@@ -1625,10 +3393,12 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 wechat_id=body.get("wechat_id", ""),
                 category=body.get("category", ""),
                 notes=body.get("notes", ""),
+                rss_url=body.get("rss_url", ""),
+                feed_type=body.get("feed_type", "rss"),
             )
             self._json({"success": True, "competitor_id": cid})
         except Exception as e:
-            self._json({"error": str(e)})
+            self._json({"error": _safe_err(e)})
 
     def _add_competitor_article(self, body):
         """Add a competitor article."""
@@ -1652,7 +3422,72 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             )
             self._json({"success": True})
         except Exception as e:
-            self._json({"error": str(e)})
+            self._json({"error": _safe_err(e)})
+
+    def _scan_competitors(self, body):
+        """Trigger competitor RSS scan + AI insight generation."""
+        job_id = f"comp_scan_{int(datetime.now().timestamp())}"
+        _running_jobs[job_id] = {"status": "running", "type": "competitor_scan"}
+
+        def run():
+            try:
+                from article.analytics import (scan_all_competitor_rss,
+                                               generate_competitive_insights,
+                                               seed_default_competitors)
+                seed_default_competitors()
+                results = scan_all_competitor_rss(limit_per=30)
+                new_total = sum(r.get("new", 0) for r in results if "new" in r)
+                insights = generate_competitive_insights()
+                _running_jobs[job_id] = {
+                    "status": "done", "type": "competitor_scan",
+                    "scan_results": results,
+                    "new_articles": new_total,
+                    "insights_count": len(insights),
+                }
+            except Exception as e:
+                _running_jobs[job_id] = {"status": "error", "type": "competitor_scan",
+                                         "error": str(e)[:500]}
+
+        threading.Thread(target=run, daemon=True).start()
+        self._json({"job_id": job_id, "status": "started"})
+
+    def _seed_competitors(self, body):
+        """Seed default competitor fleet."""
+        try:
+            from article.analytics import seed_default_competitors
+            count = seed_default_competitors()
+            self._json({"success": True, "seeded": count})
+        except Exception as e:
+            self._json({"error": _safe_err(e)})
+
+    def _set_competitor_rss(self, body):
+        """Set RSS URL for a competitor."""
+        try:
+            from article.analytics import update_competitor_rss
+            cid = body.get("competitor_id")
+            rss_url = body.get("rss_url", "").strip()
+            if not cid:
+                self._json({"error": "competitor_id required"})
+                return
+            update_competitor_rss(int(cid), rss_url,
+                                  feed_type=body.get("feed_type", ""))
+            self._json({"success": True})
+        except Exception as e:
+            self._json({"error": _safe_err(e)})
+
+    def _delete_competitor(self, body):
+        """Delete a competitor."""
+        try:
+            from article.analytics import delete_competitor
+            cid = body.get("competitor_id")
+            if not cid:
+                self._json({"error": "competitor_id required"})
+                return
+            delete_competitor(int(cid))
+            _audit(self._audit_actor(), "competitor.delete", target=str(cid))
+            self._json({"success": True})
+        except Exception as e:
+            self._json({"error": _safe_err(e)})
 
     def _scan_topics(self, body):
         """Manually trigger a topic scan."""
@@ -1681,6 +3516,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         if not topic:
             self._json({"error": "topic required"})
             return
+        # 从待审批队列移除
+        _pending_approvals.pop(topic, None)
         job_id = _launch_analysis_job(topic, context)
         self._json({"job_id": job_id, "status": "started", "topic": topic})
 
@@ -1689,12 +3526,30 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         topic = body.get("topic", "").strip()
         if topic:
             _skipped_topics.add(topic)
+            _save_skipped_topics()
+            # 从待审批队列移除
+            _pending_approvals.pop(topic, None)
         self._json({"success": True, "skipped": topic})
 
     def _set_feishu_webhook(self, body):
         global FEISHU_WEBHOOK_URL
         url = body.get("url", "").strip()
+        # SSRF 防护：拒绝内网；空字符串允许（用于禁用通知）
+        if url and _is_private_or_invalid_url(url):
+            self._json({"error": "webhook url not allowed (must be public https)"})
+            return
+        # 进一步限制 host 到飞书官方域名（避免被改到任意外网回调）
+        if url:
+            try:
+                host = _sec_urlparse(url).hostname or ""
+                if not (host.endswith("feishu.cn") or host.endswith("larksuite.com")):
+                    self._json({"error": "webhook url must be on feishu.cn or larksuite.com"})
+                    return
+            except Exception:
+                self._json({"error": "invalid webhook url"})
+                return
         FEISHU_WEBHOOK_URL = url
+        _audit(self._audit_actor(), "feishu.set_webhook", detail=("disabled" if not url else "set"))
         self._json({"success": True, "url": url})
 
     def _test_feishu_webhook(self, body):
@@ -1702,8 +3557,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self._json({"success": True, "sent": bool(FEISHU_WEBHOOK_URL)})
 
     def _video_generate_script(self, body):
-        topic = body.get("topic", "").strip()
-        context = body.get("context", "")
+        topic = _cap_llm_input(body.get("topic", "").strip(), _LLM_TOPIC_MAX)
+        context = _cap_llm_input(body.get("context", ""), _LLM_CONTEXT_MAX)
         platform = body.get("platform", "douyin")
         duration = body.get("duration", 60)
         if not topic:
@@ -1773,7 +3628,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
         self._json({"success": True, "project_id": pid, "stage": stage})
 
     def _save_api_keys(self, body):
-        """Save API keys to .env file and update os.environ."""
+        """Save API keys to .env file and update os.environ. Requires console password."""
+        pwd = body.get("password", "")
+        if not _CONSOLE_PASSWORD:
+            self._json({"error": "Console password not configured on server"})
+            return
+        try:
+            if not _hmac.compare_digest(pwd, _CONSOLE_PASSWORD):
+                self._json({"error": "Authentication required"})
+                return
+        except Exception:
+            self._json({"error": "Authentication required"})
+            return
         env_path = os.path.join(CE_ROOT, ".env")
         existing = {}
         if os.path.exists(env_path):
@@ -1808,12 +3674,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             updated = True
 
         if updated:
-            os.makedirs(os.path.dirname(env_path), exist_ok=True)
-            with open(env_path, "w") as f:
-                f.write("# Content Engine Environment Variables\n")
-                f.write("# Auto-generated by Dashboard\n\n")
-                for k, v in existing.items():
-                    f.write(f'{k}="{v}"\n')
+            content = "# Content Engine Environment Variables\n# Auto-generated by Dashboard\n\n"
+            for k, v in existing.items():
+                content += f'{k}="{v}"\n'
+            try:
+                _atomic_write_text(env_path, content)
+            except Exception as e:
+                self._json({"error": "failed to persist .env"})
+                print(f"[SECURITY] .env atomic write failed: {e}", flush=True)
+                return
+            # 审计：记录哪些 key 被改（不记录值）
+            changed = [k for k, val in [
+                ("AIROUTER_API_KEY", airouter_key), ("AIROUTER_API_BASE", airouter_base),
+                ("ANTHROPIC_API_KEY", anthropic_key), ("OPENAI_API_KEY", openai_key)
+            ] if val]
+            _audit(self._audit_actor(), "config.save_api_keys", detail=",".join(changed))
             self._json({"success": True, "message": "API keys saved. Will take effect on next scan."})
         else:
             self._json({"error": "No keys provided"})
@@ -1941,13 +3816,62 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 "images": image_results,
             })
         except Exception as e:
-            self._json({"error": str(e)})
+            self._json({"error": _safe_err(e)})
 
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
         params = parse_qs(parsed.query)
         date = params.get("date", [None])[0]
+
+        # /api/me 在鉴权之前响应，前端用它做"是否已登录"探测
+        if path == "/api/me":
+            user = self._current_user() if _AUTH_CONFIGURED else "anonymous"
+            resp = {"user": user, "auth_configured": _AUTH_CONFIGURED}
+            # 如果是 cookie session 用户，返回 CSRF token 供前端后续 POST 使用
+            if user:
+                cookies = _parse_cookies(self.headers.get("Cookie", ""))
+                sess_tok = cookies.get(_SESSION_COOKIE)
+                if sess_tok and _session_valid(sess_tok):
+                    resp["csrf_token"] = _csrf_generate(sess_tok)
+            self._json(resp)
+            return
+
+        # 全局鉴权 + 速率限制：所有 /api/* 必须带凭证 + 不超速
+        if path.startswith("/api/"):
+            if not self._require_auth():
+                return
+            if not self._rate_ok(path):
+                return
+
+        # 图片文件服务 — 直接返回二进制，不走 JSON
+        if path == "/api/article-image":
+            file_param = params.get("file", [None])[0]
+            if not file_param:
+                self._json({"error": "file parameter required"})
+                return
+            safe_name = os.path.basename(file_param)  # 防止目录穿越
+            img_path = os.path.join(_IMAGE_STORE, safe_name)
+            if not os.path.isfile(img_path):
+                self.send_error(404, "Image not found")
+                return
+            ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else ""
+            mime_map = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                        "gif": "image/gif", "webp": "image/webp"}
+            mime = mime_map.get(ext, "application/octet-stream")
+            try:
+                with open(img_path, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", mime)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "public, max-age=86400")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self.send_error(500, str(e))
+            return
 
         api_routes = {
             "/api/news": lambda: get_news(date),
@@ -1965,11 +3889,18 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "/api/analytics/summary": lambda: _analytics_summary(),
             "/api/analytics/articles": lambda: _analytics_articles(),
             "/api/analytics/competitors": lambda: _analytics_competitors(),
+            "/api/competitors/timeline": lambda: _competitors_timeline(params),
+            "/api/competitors/topic-stats": lambda: _competitors_topic_stats(params),
+            "/api/competitors/cadence": lambda: _competitors_cadence(params),
+            "/api/competitors/coverage": lambda: _competitors_coverage(),
+            "/api/competitors/insights": lambda: _competitors_insights(),
+            "/api/competitors/scan-status": lambda: _competitors_scan_status(),
             "/api/recommendations": lambda: _get_recommendations(),
             "/api/video/scripts": lambda: _list_video_scripts(),
             "/api/projects": lambda: _list_projects(params.get("stage", [""])[0]),
             "/api/engagement": lambda: _get_engagement(date, params.get("item_id", [None])[0]),
             "/api/topic-events": lambda: _get_topic_events(),
+            "/api/topic-trends": lambda: _get_topic_trends(int(params.get("top", ["10"])[0])),
             "/api/topic-hits": lambda: _get_topic_hits(params.get("week", [None])[0]),
             "/api/system-health": lambda: _get_system_health(),
         }
@@ -1984,13 +3915,14 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         if path == "/api/analysis-detail":
             fpath = params.get("file", [None])[0]
-            if fpath and os.path.exists(fpath):
+            # 收紧：仅允许落在 content-data/analysis 子目录、且非危险扩展名
+            if fpath and _is_safe_detail_path(fpath) and os.path.exists(fpath):
                 with open(fpath, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 data = _reparse_failed_insights(data, fpath)
                 self._json(data)
             else:
-                self._json({"error": "file not found"})
+                self._json({"error": "file not found or access denied"})
             return
 
         if path == "/api/project":
@@ -2002,13 +3934,32 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self._json({"error": "id required"})
             return
 
+        if path == "/api/fetch-page-text":
+            url = params.get("url", [None])[0]
+            if not url:
+                self._json({"error": "url required"})
+                return
+            if _is_private_or_invalid_url(url):
+                self._json({"error": "url not allowed"})
+                return
+            # Check cache first
+            cached = _get_cached_page_texts([url])
+            if url in cached:
+                self._json({"text": cached[url]["text"], "url": url, "status": cached[url]["status"], "cached": True})
+                return
+            # Fetch and cache
+            result = _fetch_and_cache_page_text(url)
+            self._json({"text": result["text"], "url": url, "status": result["status"]})
+            return
+
         if path == "/api/article-detail":
             fpath = params.get("file", [None])[0]
-            if fpath and os.path.exists(fpath):
+            # 收紧：仅允许落在 content-data/articles 子目录、且非危险扩展名
+            if fpath and _is_safe_detail_path(fpath) and os.path.exists(fpath):
                 with open(fpath, "r", encoding="utf-8") as f:
                     self._json({"content": f.read(), "file": fpath})
             else:
-                self._json({"error": "file not found"})
+                self._json({"error": "file not found or access denied"})
             return
 
         if path in api_routes:
@@ -2023,22 +3974,80 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Type", "image/svg+xml")
                 self.send_header("Content-Length", len(body))
                 self.send_header("Cache-Control", "public, max-age=86400")
+                self._send_security_headers()
                 self.end_headers()
                 self.wfile.write(body)
             else:
-                self.send_error(404)
+                self._send_error_json(404, "not found")
         elif path == "/" or path == "/index.html":
-            self.path = "/index.html"
-            super().do_GET()
+            # 用白名单方式只服务 index.html，杜绝 /server.py /start.sh /Dockerfile 等源码暴露
+            # 同时做模板替换，注入 Sentry frontend config（Stage 2.6）
+            index_path = os.path.join(DASHBOARD_DIR, "index.html")
+            if os.path.exists(index_path):
+                with open(index_path, "r", encoding="utf-8") as f:
+                    text = f.read()
+                # 模板变量替换
+                _sentry_fe_dsn = os.environ.get("SENTRY_FRONTEND_DSN", "")
+                text = text.replace("__SENTRY_FRONTEND_DSN__", _sentry_fe_dsn)
+                text = text.replace("__SENTRY_ENVIRONMENT__", _SENTRY_ENV)
+                text = text.replace("__SENTRY_RELEASE__", _SENTRY_RELEASE)
+                body = text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-cache")
+                self._send_security_headers()
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._send_error_json(500, "index.html missing")
+        elif path == "/robots.txt":
+            body = b"User-agent: *\nDisallow: /\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self._send_security_headers()
+            self.end_headers()
+            self.wfile.write(body)
+        elif path == "/healthz":
+            # 健康检查：DB ping + LLM 配置 + 上线时长。不需要鉴权（探活）
+            uptime = int(time.time() - _system_health.get("server_start_time", time.time()))
+            health = {"status": "ok", "uptime_seconds": uptime}
+            try:
+                _c = _workflow_conn()
+                _c.execute("SELECT 1").fetchone()
+                _c.close()
+                health["db"] = "ok"
+            except Exception:
+                health["status"] = "degraded"
+                health["db"] = "error"
+            has_llm = any(os.environ.get(k) for k in (
+                "DEEPSEEK_API_KEY", "GEMINI_API_KEY", "TOKENKEY_API_KEY",
+                "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AIROUTER_API_KEY",
+            ))
+            health["llm"] = "ok" if has_llm else "missing"
+            if health["llm"] == "missing":
+                health["status"] = "degraded"
+            health["auth_configured"] = _AUTH_CONFIGURED
+            health["console_password_set"] = bool(_CONSOLE_PASSWORD)
+            body = json.dumps(health).encode("utf-8")
+            self.send_response(200 if health["status"] == "ok" else 503)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self._send_security_headers()
+            self.end_headers()
+            self.wfile.write(body)
         else:
-            super().do_GET()
+            # 默认：拒绝。绝不再 fallthrough 到 SimpleHTTPRequestHandler.do_GET（会暴露目录所有文件）
+            self._send_error_json(404, "not found")
 
     def _json(self, data):
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Content-Length", str(len(body)))
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -2069,9 +4078,9 @@ def _do_topic_scan():
                 wvs = set(r.get("write_value", 5) for r in results)
                 _system_health["eval_method"] = "rule_fallback" if len(wvs) > 1 else "default_only"
 
-        # 自动确认高价值话题：write_value >= 8 且 hot_score >= 50
-        # 避免重复：检查是否已有同名项目或正在分析
-        auto_confirmed = 0
+        # 高价值话题 → 加入待审批队列（不再自动启动写作）
+        # 条件：write_value >= 8 且 hot_score >= 50
+        pending_added = 0
         for rec in results:
             wv = rec.get("write_value", 0)
             hs = rec.get("hot_score", 0)
@@ -2093,19 +4102,24 @@ def _do_topic_scan():
                 )
                 if already_running:
                     continue
-                # 自动启动分析
-                job_id = _launch_analysis_job(topic, "")
-                auto_confirmed += 1
-                print(f"[Auto-Confirm] Topic: {topic[:50]} (wv={wv}, hs={hs:.0f}) -> job {job_id}")
-                _send_feishu_notification(
-                    f"🤖 自动选题: {topic[:40]}",
-                    f"写作价值: {wv}/10 · 热度: {hs:.0f}\n已自动启动多模型分析"
-                )
-                if auto_confirmed >= 2:  # 每轮最多自动确认 2 个
-                    break
-        if auto_confirmed:
-            _system_health["auto_confirmed_total"] += auto_confirmed
-            print(f"[Topic Scan] Auto-confirmed {auto_confirmed} high-value topics")
+                # 加入待审批队列（不自动写作）
+                if topic not in _pending_approvals:
+                    _pending_approvals[topic] = {
+                        "topic": topic,
+                        "write_value": wv,
+                        "hot_score": hs,
+                        "added_time": time.strftime("%Y-%m-%d %H:%M"),
+                    }
+                    pending_added += 1
+                    print(f"[Pending] Topic queued for approval: {topic[:50]} (wv={wv}, hs={hs:.0f})")
+                    _send_feishu_notification(
+                        f"📋 选题待审批: {topic[:40]}",
+                        f"写作价值: {wv}/10 · 热度: {hs:.0f}\n请到 Dashboard 确认或跳过"
+                    )
+                    if pending_added >= 3:
+                        break
+        if pending_added:
+            print(f"[Topic Scan] {pending_added} topics queued for approval")
     except Exception as e:
         _system_health["last_scan_time"] = time.time()
         _system_health["last_scan_result"] = f"error: {str(e)[:100]}"
@@ -2124,7 +4138,9 @@ def _do_engagement_snapshot():
     Runs every 30 minutes to build time-series data.
     """
     today = datetime.now().strftime("%Y-%m-%d")
-    db_path = get_db_path("news", today)
+    # 直接拼当天路径，不走 get_db_path 的"最新文件"fallback——
+    # 否则当天没采集时会把快照写进旧日期的 db，导致旧文件无限膨胀
+    db_path = os.path.join(DATA_DIR, "news", f"{today}.db")
     if not os.path.exists(db_path):
         return
     _ensure_engagement_table(db_path)
@@ -2265,8 +4281,7 @@ def _do_topic_hit_analysis():
         print(f"[Topic Hits] Analyzed {len(events)} events")
     except Exception as e:
         print(f"[Topic Hits] Error: {e}")
-        import traceback
-        traceback.print_exc()
+        # Stage 2: 移除完整堆栈打印，避免在日志中泄露内部文件路径
 
 
 def _do_event_clustering():
@@ -2424,8 +4439,7 @@ def _do_event_clustering():
         print(f"[Event Cluster] Clustered {len(all_articles)} articles into {len(events)} events")
     except Exception as e:
         print(f"[Event Cluster] Error: {e}")
-        import traceback
-        traceback.print_exc()
+        # Stage 2: 移除完整堆栈打印，避免在日志中泄露内部文件路径
 
 
 def _get_system_health():
@@ -2489,6 +4503,32 @@ def _get_system_health():
     }
 
 
+_last_competitor_scan = 0  # epoch timestamp of last competitor scan
+
+
+def _do_competitor_scan():
+    """Periodic competitor RSS scan + AI insight generation (every 3h)."""
+    global _last_competitor_scan
+    # Only scan every 3 hours to avoid hammering RSS feeds
+    if time.time() - _last_competitor_scan < 10800:
+        return
+    try:
+        from article.analytics import (scan_all_competitor_rss,
+                                       generate_competitive_insights,
+                                       seed_default_competitors)
+        seed_default_competitors()
+        results = scan_all_competitor_rss(limit_per=30)
+        new_total = sum(r.get("new", 0) for r in results if "new" in r)
+        print(f"[Competitor Scan] Scanned {len(results)} feeds, {new_total} new articles")
+        if new_total > 0:
+            insights = generate_competitive_insights()
+            print(f"[Competitor Scan] Generated {len(insights)} insights")
+        _last_competitor_scan = time.time()
+    except Exception as e:
+        print(f"[Competitor Scan] Error: {e}")
+        _last_competitor_scan = time.time()  # Don't retry immediately on error
+
+
 def _schedule_topic_scan():
     """Background periodic scan every 30 minutes."""
     global _topic_scan_timer
@@ -2496,6 +4536,7 @@ def _schedule_topic_scan():
     _do_engagement_snapshot()
     _do_event_clustering()
     _do_topic_hit_analysis()
+    _do_competitor_scan()
     _topic_scan_timer = threading.Timer(1800, _schedule_topic_scan)
     _topic_scan_timer.daemon = True
     _topic_scan_timer.start()

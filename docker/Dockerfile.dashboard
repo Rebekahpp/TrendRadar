@@ -1,0 +1,28 @@
+FROM python:3.12-slim-bookworm
+
+WORKDIR /app
+
+# Install httpx for LLM API calls (briefs, translate, analysis)
+RUN pip install --no-cache-dir httpx openai google-genai pyyaml feedparser
+
+# Copy dashboard files
+COPY TrendRadar/dashboard/ /app/dashboard/
+
+# Copy content-engine (for article generation, topic detection, analytics, etc.)
+COPY content-engine/article/ /app/content-engine/article/
+COPY content-engine/brain/ /app/content-engine/brain/
+COPY content-engine/core/ /app/content-engine/core/
+COPY content-engine/config.yaml /app/content-engine/config.yaml
+
+# Create necessary directories
+RUN mkdir -p /data/output /data/content-data /app/content-engine/content-data
+
+ENV PYTHONUNBUFFERED=1 \
+    PORT=9090 \
+    DATA_DIR=/data/output \
+    CONTENT_ENGINE_PATH=/app/content-engine \
+    TRENDRADAR_OUTPUT=/data/output
+
+EXPOSE 9090
+
+CMD ["python3", "/app/dashboard/server.py"]

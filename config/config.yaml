@@ -55,28 +55,18 @@ schedule:
 platforms:
   enabled: true                         # 是否启用热榜平台抓取
   sources:
-    - id: "toutiao"
-      name: "今日头条"
-    - id: "baidu"
-      name: "百度热搜"
-    - id: "wallstreetcn-hot"
-      name: "华尔街见闻"
-    - id: "thepaper"
-      name: "澎湃新闻"
-    - id: "bilibili-hot-search"
-      name: "bilibili 热搜"
-    - id: "cls-hot"
-      name: "财联社热门"
-    - id: "ifeng"
-      name: "凤凰网"
-    - id: "tieba"
-      name: "贴吧"
-    - id: "weibo"
-      name: "微博"
-    - id: "douyin"
-      name: "抖音"
     - id: "zhihu"
       name: "知乎"
+    - id: "weibo"
+      name: "微博"
+    - id: "baidu"
+      name: "百度热搜"
+    - id: "bilibili-hot-search"
+      name: "bilibili 热搜"
+    - id: "toutiao"
+      name: "今日头条"
+    - id: "wallstreetcn-hot"
+      name: "华尔街见闻"
 
 
 
@@ -117,22 +107,35 @@ rss:
       name: "Hacker News"
       url: "https://hnrss.org/frontpage"
 
+    - id: "github-trending"
+      name: "GitHub Trending"
+      url: "https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml"
+
+    - id: "openai-blog"
+      name: "OpenAI Blog"
+      url: "https://openai.com/blog/rss.xml"
+      max_age_days: 3
+
+    - id: "the-verge-ai"
+      name: "The Verge AI"
+      url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
+
+    - id: "techcrunch-ai"
+      name: "TechCrunch AI"
+      url: "https://techcrunch.com/category/artificial-intelligence/feed/"
+
+    - id: "36kr"
+      name: "36氪"
+      url: "https://36kr.com/feed"
+
+    - id: "sspai"
+      name: "少数派"
+      url: "https://sspai.com/feed"
+
     - id: "ruanyifeng"
       name: "阮一峰的网络日志"
       url: "http://www.ruanyifeng.com/blog/atom.xml"
-      enabled: false                  # 禁用
-      # max_age_days: 3               # 示例：推送 3 天内的文章（更新较慢的博客）
-     
-    - id: "yahoo-finance"
-      name: "雅虎财经"
-      url: "https://finance.yahoo.com/news/rssindex"
-
-    # 自定义源示例
-    # - id: "custom-feed"
-    #   name: "自定义源"
-    #   url: "https://example.com/feed.xml"
-    #   enabled: false
-    #   max_age_days: 0               # 示例：禁用过滤，推送所有文章
+      max_age_days: 7
 
 
 # ===============================================================
@@ -268,7 +271,7 @@ display:
                                       # 开启后将对 RSS 进行关键词分析并在通知中展示
                                       # 关闭后跳过分析，但独立展示区不受影响
 
-    standalone: false                 # 独立展示区（完整热榜/RSS，不受关键词过滤）
+    standalone: true                  # 独立展示区（完整热榜/RSS，不受关键词过滤）
     ai_analysis: true                 # AI 分析区域
 
   # 📋 独立展示区配置
@@ -278,8 +281,8 @@ display:
   #   - AI 分析：由 ai_analysis.include_standalone 开关控制，将完整数据送入 AI 做深度分析
   # 两者共享此处的平台/RSS 配置，但开关互相独立（可只开 AI 分析、不推送展示）
   standalone:
-    platforms: ["zhihu", "wallstreetcn-hot"]     # 热榜平台 ID 列表（如 ["zhihu", "weibo"]）
-    rss_feeds: []                     # RSS 源 ID 列表（如 ["hacker-news"]）
+    platforms: ["zhihu"]              # 知乎热榜完整展示
+    rss_feeds: ["hacker-news"]        # HN 完整展示
     max_items: 20                     # 每个源最多展示条数（0=不限制）
 
 
@@ -544,7 +547,7 @@ ai_translation:
   # standalone: 独立展示区（热榜平台 + RSS 源）
   # 如果 display.regions 关闭了显示，那么这边即使开启了也不会翻译
   scope:
-    hotlist: false                  # 热榜区域
+    hotlist: true                   # 热榜区域
     rss: true                      # RSS 区域
     standalone: true               # 独立展示区
 
