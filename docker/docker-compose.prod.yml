@@ -21,7 +21,13 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - TOKENKEY_API_KEY=${TOKENKEY_API_KEY}
       - TOKENKEY_GPT_KEY=${TOKENKEY_GPT_KEY}
+      - TOKENKEY_GOOGLE_KEY=${TOKENKEY_GOOGLE_KEY:-}
+      - TOKENKEY_CLAUDE_CODE_KEY=${TOKENKEY_CLAUDE_CODE_KEY:-}
       - TOKENKEY_API_BASE=${TOKENKEY_API_BASE:-https://api.tokenkey.cn}
+      # ---- CLI Opus：真 claude CLI 走 TokenKey 跑 Opus（核心 3 模型之一）----
+      - CLAUDE_CLI_ENABLED=${CLAUDE_CLI_ENABLED:-1}
+      - CLAUDE_CLI_BASE_URL=${CLAUDE_CLI_BASE_URL:-https://api.tokenkey.dev}
+      - CLAUDE_CLI_WORKDIR=/tmp/ce-cli-work
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - AIROUTER_API_KEY=${AIROUTER_API_KEY:-}

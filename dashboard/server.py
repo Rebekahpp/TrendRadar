@@ -2129,7 +2129,8 @@ def list_analyses():
     # ── 一次性加载所有 project 行，构建路径 → project 字典 ──
     conn = _workflow_conn()
     conn.row_factory = sqlite3.Row
-    all_projs = conn.execute("SELECT id, stage, analysis_file FROM projects").fetchall()
+    all_projs = conn.execute(
+        "SELECT id, stage, analysis_file, topic, created_at FROM projects").fetchall()
     conn.close()
 
     path_lookup: dict = {}      # exact analysis_file → row
@@ -2213,6 +2214,32 @@ def list_analyses():
             seen_files.add(bn)
         except Exception:
             pass
+
+    # ── 补充无 analysis 文件的进行中/中断 project ──
+    # 分析中（stage=analysis）还没生成文件，重启后内存 job 丢失会"消失"；
+    # 这里从 db 直接补，确保刷新/切页/重启后生产线仍能看到（分析中 or 失败可重试）。
+    existing_pids = {r.get("project_id") for r in results if r.get("project_id")}
+    for p in all_projs:
+        if p["id"] in existing_pids:
+            continue
+        if p["stage"] not in ("analysis", "failed"):
+            continue  # 其他阶段应有文件，已由上面文件扫描处理
+        if p["analysis_file"]:
+            continue  # 有文件的不在此补
+        ts = 0
+        try:
+            ts = datetime.fromisoformat(p["created_at"]).timestamp()
+        except Exception:
+            pass
+        results.append({
+            "file": None,
+            "topic": p["topic"],
+            "total_insights": 0,
+            "models_succeeded": 0,
+            "timestamp": ts,
+            "stage": p["stage"],
+            "project_id": p["id"],
+        })
 
     _analyses_cache["result"] = results
     _analyses_cache["ts"] = now
@@ -4529,6 +4556,40 @@ def _do_competitor_scan():
         _last_competitor_scan = time.time()  # Don't retry immediately on error
 
 
+def _do_auto_brief(max_per_round: int = 60):
+    """给今日 AI 精选中无摘要的条目自动批量生成 brief（deepseek，便宜快）。
+
+    热搜源多数抓不到正文，AI 精选的"内容"主要靠摘要撑——采集后自动补摘要，
+    用户打开列表即有内容，无需手动点"一键生成"。
+    """
+    if os.environ.get("AUTO_BRIEF_ENABLED", "1") != "1":
+        return
+    try:
+        items = get_ai_filtered()  # 今日 AI 精选
+        if not items:
+            return
+        titles = [it["title"] for it in items if it.get("title")]
+        cached = _get_cached_briefs(titles)
+        todo = [(it["title"], it.get("url", "")) for it in items
+                if it.get("title") and it["title"] not in cached][:max_per_round]
+        if not todo:
+            return
+        print(f"[Auto-Brief] 为 {len(todo)} 条 AI 精选生成摘要...")
+        from concurrent.futures import ThreadPoolExecutor
+        done = 0
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futs = [pool.submit(_generate_and_cache_brief, t, u) for t, u in todo]
+            for f in futs:
+                try:
+                    if "brief" in f.result():
+                        done += 1
+                except Exception:
+                    pass
+        print(f"[Auto-Brief] 完成 {done}/{len(todo)} 条摘要")
+    except Exception as e:
+        print(f"[Auto-Brief] Error: {e}")
+
+
 def _schedule_topic_scan():
     """Background periodic scan every 30 minutes."""
     global _topic_scan_timer
@@ -4537,12 +4598,37 @@ def _schedule_topic_scan():
     _do_event_clustering()
     _do_topic_hit_analysis()
     _do_competitor_scan()
+    _do_auto_brief()
     _topic_scan_timer = threading.Timer(1800, _schedule_topic_scan)
     _topic_scan_timer.daemon = True
     _topic_scan_timer.start()
 
 
+def _recover_stuck_analyses():
+    """启动时把上次中断的"分析中"project 标记为失败。
+
+    异步分析 job 在内存（_running_jobs），dashboard 重启即丢失。db 里残留的
+    stage='analysis' 都是中断的孤儿——标 failed 让前端显示"可重新分析"，
+    而不是永远转圈或凭空消失。
+    """
+    try:
+        conn = _workflow_conn()
+        now = datetime.now().isoformat()
+        cur = conn.execute(
+            "UPDATE projects SET stage='failed', updated_at=?, "
+            "notes='服务重启导致分析中断，可点重新分析' WHERE stage='analysis'",
+            (now,))
+        n = cur.rowcount
+        conn.commit()
+        conn.close()
+        if n:
+            print(f"[Startup] 标记 {n} 个中断的分析为 failed（可重新分析）")
+    except Exception as e:
+        print(f"[Startup] recover stuck analyses error: {e}")
+
+
 def main():
+    _recover_stuck_analyses()
     threading.Thread(target=_schedule_topic_scan, daemon=True).start()
     server = HTTPServer(("0.0.0.0", PORT), DashboardHandler)
     print(f"AI Radar Dashboard running at http://localhost:{PORT}")

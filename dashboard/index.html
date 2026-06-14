@@ -3307,11 +3307,21 @@ async function loadAIAnalysis() {
       dedupedList.push(analysisList[di]);
     }
     analysisList = dedupedList;
-    var postInsightsStages = ['writing', 'review', 'human_review', 'ready', 'published', 'rejected'];
-    var allActiveItems = analysisList.filter(function(a) { return (a.total_insights || 0) > 0 || postInsightsStages.indexOf(a.stage) >= 0; });
+    // 内存中正在跑的 job（顶部进度卡已渲染）→ 列表去重，避免同一分析显示两次
+    var runningPids = {};
+    for (var rj = 0; rj < runningJobs.length; rj++) {
+      if (runningJobs[rj].project_id) runningPids[runningJobs[rj].project_id] = 1;
+    }
+    // 'analysis' 纳入显示：分析中/重启中断的 project（无文件、insights=0）也要在生产线可见
+    var postInsightsStages = ['analysis', 'writing', 'review', 'human_review', 'ready', 'published', 'rejected'];
+    var allActiveItems = analysisList.filter(function(a) {
+      if (runningPids[a.project_id]) return false;       // 已在顶部进度卡
+      if (a.stage === 'failed') return false;            // 失败项归到下方失败区
+      return (a.total_insights || 0) > 0 || postInsightsStages.indexOf(a.stage) >= 0;
+    });
     // 按阶段过滤：从完整列表过滤，确保 count 和显示一致
-    var activeItems = _pipelineStageFilter ? analysisList.filter(function(a) { return (a.stage || 'insights') === _pipelineStageFilter; }) : allActiveItems;
-    var failedItems = analysisList.filter(function(a) { return (a.total_insights || 0) === 0 && (a.models_succeeded || 0) === 0; });
+    var activeItems = _pipelineStageFilter ? analysisList.filter(function(a) { return !runningPids[a.project_id] && (a.stage || 'insights') === _pipelineStageFilter; }) : allActiveItems;
+    var failedItems = analysisList.filter(function(a) { return !runningPids[a.project_id] && a.stage === 'failed'; });
 
     _pipelineData = activeItems;
 
