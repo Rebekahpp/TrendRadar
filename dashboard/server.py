@@ -1637,8 +1637,10 @@ def _launch_analysis_job(topic: str, context: str = "") -> str:
                 f"**分歧观点**: {len(rd.get('disagreement_points', []))} 个\n\n"
                 f"🔗 [查看详情]({os.environ.get('DASHBOARD_URL', 'https://content.orbitlogic.dev')})",
             )
-            # 自动进入写文章阶段（全自动 pipeline）
-            if rd.get('total_insights', 0) >= 5:
+            # 分析完成后默认停在「选观点」阶段，等用户手动勾选观点再写作（人工把控质量）。
+            # 之前是 AI 自动选 7 个观点抢先写，跳过了用户的选择步骤。
+            # 如需恢复全自动 pipeline：设环境变量 AUTO_WRITE_ENABLED=1
+            if os.environ.get("AUTO_WRITE_ENABLED", "0") == "1" and rd.get('total_insights', 0) >= 5:
                 _auto_generate_article(filepath, project_id, topic)
         except Exception as e:
             _running_jobs[job_id] = {"status": "error", "error": str(e), "topic": topic, "project_id": project_id}

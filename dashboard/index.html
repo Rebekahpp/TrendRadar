@@ -3739,6 +3739,36 @@ function renderAnalysisDetail(container, data) {
     html += '</div>';
   }
 
+  // 🧬 核心观点溯源面板（文章阶段展示：本文背后的多模型观点池 + 来源 + 原创度）
+  if (['writing','review','human_review','ready','published'].indexOf(stg) >= 0) {
+    var _mi = data.merged_insights || [];
+    if (_mi.length > 0) {
+      var _modelCount = {};
+      _mi.forEach(function(ins){ var m = ins.source_label || ins.model || '未知'; _modelCount[m] = (_modelCount[m]||0)+1; });
+      html += '<div style="margin-top:16px;padding:14px;background:#f0f9ff;border:1px solid #bae6fd;border-radius:10px">';
+      html += '<div style="font-size:13px;font-weight:700;margin-bottom:8px;color:#0369a1">🧬 本文核心观点溯源 <span style="font-weight:400;color:#64748b;font-size:11px">— 共 ' + _mi.length + ' 个观点，来自多模型并行分析</span></div>';
+      html += '<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">';
+      Object.keys(_modelCount).forEach(function(m){
+        html += '<span style="font-size:10px;padding:2px 8px;background:#dbeafe;color:#1e40af;border-radius:10px;font-weight:600">' + escapeHtml(m) + ' ×' + _modelCount[m] + '</span>';
+      });
+      html += '</div>';
+      html += '<div style="display:flex;flex-direction:column;gap:6px;max-height:320px;overflow-y:auto">';
+      _mi.forEach(function(ins){
+        var _oc = ins.originality === 'high' ? '#16a34a' : ins.originality === 'medium' ? '#f59e0b' : '#94a3b8';
+        var _ol = ins.originality === 'high' ? '高原创' : ins.originality === 'medium' ? '中原创' : '常规';
+        var _t = ins.title || ins.core_insight || '';
+        var _m = ins.source_label || ins.model || '';
+        html += '<div style="padding:8px 10px;background:white;border-radius:6px;border-left:3px solid ' + _oc + '">' +
+          '<div style="font-size:12px;font-weight:600;line-height:1.4">' + escapeHtml(_t) + '</div>' +
+          '<div style="font-size:10px;color:#64748b;margin-top:3px">' +
+          (_m ? '<span style="color:#3b82f6">📍 ' + escapeHtml(_m) + '</span> · ' : '') +
+          '<span style="color:' + _oc + '">' + _ol + '</span></div>' +
+          '</div>';
+      });
+      html += '</div></div>';
+    }
+  }
+
   // 工作流操作按钮
   html += '<div style="margin-top:16px;padding:14px;background:#f8fafc;border-radius:10px;border:1px solid #e2e8f0">';
   html += '<div style="font-size:13px;font-weight:700;margin-bottom:10px">📋 工作流操作</div>';
