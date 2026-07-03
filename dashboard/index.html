@@ -3065,11 +3065,35 @@ async function generatePreview(idx) {
 }
 
 async function useImage(idx, imagePath) {
-  __toast('✅ 图 ' + (idx + 1) + ' 已选定', 'success');
+  var s = _imageStudioState;
+  var articleFile = s.articleFile;
+  var placeholder = (document.getElementById('img-prompt-' + idx) || {}).value || (s.placeholders[idx] || '');
   var previewEl = document.getElementById('img-preview-' + idx);
-  if (previewEl) {
-    var useBtn = previewEl.querySelector('[onclick*="useImage"]');
-    if (useBtn) { useBtn.textContent = '✓ 已选定'; useBtn.disabled = true; useBtn.style.background = '#d1fae5'; }
+  var useBtn = previewEl ? previewEl.querySelector('[onclick*="useImage"]') : null;
+
+  if (!articleFile) { __toast('❌ 没有文章文件，无法嵌入', 'error'); return; }
+  if (!imagePath) { __toast('❌ 缺少图片路径', 'error'); return; }
+
+  if (useBtn) { useBtn.disabled = true; useBtn.textContent = '⏳ 嵌入中...'; }
+
+  try {
+    var resp = await fetch('/api/apply-image', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ article_file: articleFile, placeholder: placeholder, image_path: imagePath })
+    });
+    var data = await resp.json();
+    if (data.success) {
+      __toast('✅ 图 ' + (idx + 1) + ' 已嵌入文章', 'success');
+      if (useBtn) { useBtn.textContent = '✓ 已嵌入文章'; useBtn.disabled = true; useBtn.style.background = '#d1fae5'; }
+      var slotEl = document.getElementById('img-slot-' + idx);
+      if (slotEl) slotEl.dataset.used = '1';
+    } else {
+      __toast('❌ 嵌入失败: ' + (data.error || '未知错误'), 'error');
+      if (useBtn) { useBtn.disabled = false; useBtn.textContent = '✅ 使用此图'; }
+    }
+  } catch(e) {
+    __toast('❌ 请求失败: ' + e.message, 'error');
+    if (useBtn) { useBtn.disabled = false; useBtn.textContent = '✅ 使用此图'; }
   }
 }
 

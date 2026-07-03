@@ -2601,6 +2601,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._generate_image_preview(body)
         elif path == "/api/extract-image-placeholders":
             self._extract_image_placeholders(body)
+        elif path == "/api/apply-image":
+            self._apply_image(body)
         elif path == "/api/fetch-page-texts-batch":
             self._fetch_page_texts_batch(body)
         elif path == "/api/article-structure":
@@ -2961,6 +2963,59 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             content = f.read()
         placeholders = _re.findall(r'\[IMAGE:\s*(.+?)\]', content)
         self._json({"placeholders": placeholders, "count": len(placeholders)})
+
+    def _apply_image(self, body):
+        """Embed a chosen preview image into the article file, replacing its
+        [IMAGE: placeholder] with a markdown image reference.
+
+        入参: {article_file, placeholder, image_path}
+        - article_file 必须落在 content-data/articles 白名单内（复用 _is_safe_detail_path）
+        - image_path 必须落在 _IMAGE_STORE 内，防止读取任意文件
+        """
+        article_file = body.get("article_file", "")
+        placeholder = (body.get("placeholder") or "").strip()
+        image_path = body.get("image_path", "")
+
+        if not article_file or not _is_safe_detail_path(article_file) or not os.path.exists(article_file):
+            self._json({"error": "article_file not found or access denied"})
+            return
+        if not placeholder:
+            self._json({"error": "placeholder is required"})
+            return
+        if not image_path:
+            self._json({"error": "image_path is required"})
+            return
+
+        real_img = os.path.realpath(image_path)
+        real_store = os.path.realpath(_IMAGE_STORE)
+        if not (real_img == real_store or real_img.startswith(real_store + os.sep)):
+            self._json({"error": "image_path access denied"})
+            return
+        if not os.path.isfile(real_img):
+            self._json({"error": "image file not found"})
+            return
+
+        filename = os.path.basename(real_img)
+
+        import re as _re
+        try:
+            with open(article_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            desc_escaped = _re.escape(placeholder)
+            pattern = r'\[IMAGE:\s*' + desc_escaped + r'\]'
+            replacement = '![{}](/api/article-image?file={})'.format(placeholder, filename)
+            new_content, n = _re.subn(pattern, replacement, content, count=1)
+
+            if n == 0:
+                self._json({"error": "placeholder not found in article (可能已被替换或描述不一致)"})
+                return
+
+            _atomic_write_text(article_file, new_content)
+            _audit("dashboard", "image.apply", target=article_file, detail=f"placeholder={placeholder[:80]} file={filename}")
+            self._json({"success": True, "filename": filename, "article_file": article_file})
+        except Exception as e:
+            self._json({"error": str(e)})
 
     def _generate_image_preview(self, body):
         """Generate a single image preview with custom prompt and model selection.
