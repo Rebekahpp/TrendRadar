@@ -560,8 +560,90 @@ def _parse_cookies(header_value: str):
 
 _topic_scan_timer = None
 _skipped_topics = set()
-_pending_approvals = {}  # topic -> {topic, write_value, hot_score, added_time}
+_pending_approvals = {}  # topic -> {topic, write_value, hot_score, added_at, expires_at}
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+
+# 待审批选题不是永久 backlog。旧实现纯内存、无 TTL、只增不减：server 连跑 7 天后
+# 积到 87 条，7 月 4 日的「7 月 15 日下线」在 8 月 11 日仍占推荐位。
+PENDING_APPROVAL_TTL_DAYS = max(1, int(os.environ.get("PENDING_APPROVAL_TTL_DAYS", "3")))
+_PENDING_APPROVALS_FILE = os.path.join(DATA_DIR, ".pending_approvals.json")
+
+
+def _save_pending_approvals():
+    try:
+        os.makedirs(os.path.dirname(_PENDING_APPROVALS_FILE), exist_ok=True)
+        tmp = _PENDING_APPROVALS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_pending_approvals, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, _PENDING_APPROVALS_FILE)
+    except Exception as exc:
+        print(f"[Pending] save failed: {exc}", flush=True)
+
+
+def _load_pending_approvals():
+    global _pending_approvals
+    try:
+        if os.path.exists(_PENDING_APPROVALS_FILE):
+            with open(_PENDING_APPROVALS_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                _pending_approvals = data
+    except Exception as exc:
+        print(f"[Pending] load failed: {exc}", flush=True)
+        _pending_approvals = {}
+
+
+def _pending_added_at(entry: dict) -> float:
+    raw = entry.get("added_at")
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    # 兼容旧内存结构里的 added_time="YYYY-MM-DD HH:MM"
+    text = entry.get("added_time", "")
+    try:
+        return time.mktime(time.strptime(text, "%Y-%m-%d %H:%M"))
+    except Exception:
+        return time.time()
+
+
+def _prune_pending_approvals(save: bool = True) -> int:
+    """Remove approvals older than TTL; returns removed count."""
+    now = time.time()
+    ttl_seconds = PENDING_APPROVAL_TTL_DAYS * 86400
+    expired = []
+    for topic, entry in list(_pending_approvals.items()):
+        expires_at = entry.get("expires_at")
+        if not isinstance(expires_at, (int, float)):
+            expires_at = _pending_added_at(entry) + ttl_seconds
+            entry["expires_at"] = expires_at
+            entry["added_at"] = _pending_added_at(entry)
+        if now >= float(expires_at):
+            expired.append(topic)
+    for topic in expired:
+        _pending_approvals.pop(topic, None)
+    if expired and save:
+        _save_pending_approvals()
+    if expired:
+        print(f"[Pending] pruned {len(expired)} expired topic(s), ttl={PENDING_APPROVAL_TTL_DAYS}d", flush=True)
+    return len(expired)
+
+
+def _pending_approvals_payload() -> dict:
+    _prune_pending_approvals()
+    now = time.time()
+    items = []
+    for topic, entry in _pending_approvals.items():
+        item = dict(entry)
+        item.setdefault("topic", topic)
+        added_at = _pending_added_at(item)
+        expires_at = float(item.get("expires_at") or (added_at + PENDING_APPROVAL_TTL_DAYS * 86400))
+        item["added_at"] = added_at
+        item["expires_at"] = expires_at
+        item["age_hours"] = round(max(0, now - added_at) / 3600, 1)
+        item["expires_in_hours"] = round(max(0, expires_at - now) / 3600, 1)
+        items.append(item)
+    items.sort(key=lambda x: x.get("added_at", 0), reverse=True)
+    return {"items": items, "count": len(items), "ttl_days": PENDING_APPROVAL_TTL_DAYS}
+
 
 # Persist skipped topics to disk so they survive server restarts
 _SKIPPED_TOPICS_FILE = os.path.join(DATA_DIR, ".skipped_topics.json")
@@ -584,6 +666,8 @@ def _save_skipped_topics():
         pass
 
 _load_skipped_topics()
+_load_pending_approvals()
+_prune_pending_approvals()
 
 # System health tracking
 _system_health = {
@@ -1998,6 +2082,7 @@ def _get_topic_trends(top_n=10):
 
 def _get_recommendations():
     try:
+        _prune_pending_approvals()
         from article.topic_detector import get_cached_recommendations
         data = get_cached_recommendations()
         recs = data.get("recommendations", [])
@@ -2587,6 +2672,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._confirm_recommendation(body)
         elif path == "/api/recommendation/skip":
             self._skip_recommendation(body)
+        elif path == "/api/pending-approvals/clear":
+            self._clear_pending_approvals(body)
         elif path == "/api/set-feishu-webhook":
             self._set_feishu_webhook(body)
         elif path == "/api/test-feishu-webhook":
@@ -3635,7 +3722,8 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             self._json({"error": "topic required"})
             return
         # 从待审批队列移除
-        _pending_approvals.pop(topic, None)
+        if _pending_approvals.pop(topic, None) is not None:
+            _save_pending_approvals()
         job_id = _launch_analysis_job(topic, context)
         self._json({"job_id": job_id, "status": "started", "topic": topic})
 
@@ -3646,8 +3734,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             _skipped_topics.add(topic)
             _save_skipped_topics()
             # 从待审批队列移除
-            _pending_approvals.pop(topic, None)
+            if _pending_approvals.pop(topic, None) is not None:
+                _save_pending_approvals()
         self._json({"success": True, "skipped": topic})
+
+    def _clear_pending_approvals(self, body):
+        """Clear expired entries (default) or all pending approvals."""
+        clear_all = bool(body.get("all"))
+        if clear_all:
+            removed = len(_pending_approvals)
+            _pending_approvals.clear()
+            _save_pending_approvals()
+        else:
+            removed = _prune_pending_approvals()
+        payload = _pending_approvals_payload()
+        payload.update({"success": True, "removed": removed})
+        self._json(payload)
 
     def _set_feishu_webhook(self, body):
         global FEISHU_WEBHOOK_URL
@@ -4014,6 +4116,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "/api/competitors/insights": lambda: _competitors_insights(),
             "/api/competitors/scan-status": lambda: _competitors_scan_status(),
             "/api/recommendations": lambda: _get_recommendations(),
+            "/api/pending-approvals": lambda: _pending_approvals_payload(),
             "/api/video/scripts": lambda: _list_video_scripts(),
             "/api/projects": lambda: _list_projects(params.get("stage", [""])[0]),
             "/api/engagement": lambda: _get_engagement(date, params.get("item_id", [None])[0]),
@@ -4197,7 +4300,8 @@ def _do_topic_scan():
                 _system_health["eval_method"] = "rule_fallback" if len(wvs) > 1 else "default_only"
 
         # 高价值话题 → 加入待审批队列（不再自动启动写作）
-        # 条件：write_value >= 8 且 hot_score >= 50
+        # 条件：write_value >= 8 且 hot_score >= 50；超过 TTL 自动过期。
+        _prune_pending_approvals()
         pending_added = 0
         for rec in results:
             wv = rec.get("write_value", 0)
@@ -4222,12 +4326,16 @@ def _do_topic_scan():
                     continue
                 # 加入待审批队列（不自动写作）
                 if topic not in _pending_approvals:
+                    now = time.time()
                     _pending_approvals[topic] = {
                         "topic": topic,
                         "write_value": wv,
                         "hot_score": hs,
+                        "added_at": now,
                         "added_time": time.strftime("%Y-%m-%d %H:%M"),
+                        "expires_at": now + PENDING_APPROVAL_TTL_DAYS * 86400,
                     }
+                    _save_pending_approvals()
                     pending_added += 1
                     print(f"[Pending] Topic queued for approval: {topic[:50]} (wv={wv}, hs={hs:.0f})")
                     _send_feishu_notification(

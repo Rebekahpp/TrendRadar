@@ -6680,12 +6680,14 @@ async function renderTopicPool() {
   var content = document.getElementById('content');
   content.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted)">正在加载智能推荐...</div>';
   try {
-    var [data, analyses, jobs] = await Promise.all([
+    var [data, pendingData, analyses, jobs] = await Promise.all([
       fetchJSON('/api/recommendations'),
+      fetchJSON('/api/pending-approvals').catch(function() { return {items:[], count:0, ttl_days:3}; }),
       fetchJSON('/api/analyses').catch(function() { return []; }),
       fetchJSON('/api/jobs').catch(function() { return {}; }),
     ]);
     var recs = data.recommendations || [];
+    var pendingItems = pendingData.items || [];
     var scanTime = data.scan_time ? new Date(data.scan_time * 1000).toLocaleString('zh-CN') : '尚未扫描';
 
     // 构建 pipeline 话题查找表：已在生产线的话题 → {stage, project_id}
@@ -6721,9 +6723,29 @@ async function renderTopicPool() {
 
     html += '<div class="stats-row" style="margin-bottom:16px">' +
       '<div class="stat-card"><div class="label">推荐话题</div><div class="value">' + recs.length + '</div></div>' +
+      '<div class="stat-card"><div class="label">待审批队列</div><div class="value" style="color:#f59e0b">' + pendingItems.length + '</div><div class="sub">' + (pendingData.ttl_days || 3) + ' 天自动过期</div></div>' +
       '<div class="stat-card"><div class="label">扫描间隔</div><div class="value" style="font-size:16px">30 分钟</div></div>' +
-      '<div class="stat-card"><div class="label">筛选标准</div><div class="value" style="font-size:14px">3+ 来源</div><div class="sub">交叉验证</div></div>' +
+      '<div class="stat-card"><div class="label">筛选标准</div><div class="value" style="font-size:14px">写作价值≥8</div><div class="sub">热度≥50</div></div>' +
       '</div>';
+
+    if (pendingItems.length > 0) {
+      html += '<div style="margin-bottom:16px;padding:12px 14px;border:1px solid #fde68a;background:#fffbeb;border-radius:8px">' +
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px">' +
+          '<div><strong style="font-size:13px;color:#92400e">⏳ 待审批队列</strong>' +
+          '<span style="font-size:11px;color:#a16207;margin-left:8px">超过 ' + (pendingData.ttl_days || 3) + ' 天自动移除</span></div>' +
+          '<button class="btn" style="font-size:11px;color:#b91c1c" onclick="clearPendingApprovals()">清空全部</button>' +
+        '</div><div style="display:flex;flex-direction:column;gap:6px">';
+      pendingItems.slice(0, 20).forEach(function(p) {
+        html += '<div style="display:flex;align-items:center;gap:8px;padding:7px 9px;background:white;border:1px solid #fde68a;border-radius:6px">' +
+          '<div style="flex:1;min-width:0"><div style="font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(p.topic || '') + '</div>' +
+          '<div style="font-size:10px;color:var(--text-muted)">已等待 ' + (p.age_hours || 0) + 'h · ' + (p.expires_in_hours || 0) + 'h 后过期 · 写作价值 ' + (p.write_value || 0) + '/10</div></div>' +
+          '<button class="btn btn-primary" style="font-size:11px;padding:4px 9px" onclick="confirmTopic(this,\'' + escapeJs(p.topic || '') + '\')">✅ 写</button>' +
+          '<button class="pick-btn" style="font-size:11px;padding:3px 8px;color:#9ca3af" onclick="skipTopic(\'' + escapeJs(p.topic || '') + '\')">跳过</button>' +
+          '</div>';
+      });
+      if (pendingItems.length > 20) html += '<div style="font-size:10px;color:var(--text-muted)">仅显示前 20 条，共 ' + pendingItems.length + ' 条</div>';
+      html += '</div></div>';
+    }
 
     if (recs.length === 0) {
       var recError = data.error || '';
@@ -6926,6 +6948,23 @@ async function skipTopic(topicTitle) {
     renderContent();
   } catch (e) {
     alert('操作失败: ' + e.message);
+  }
+}
+
+async function clearPendingApprovals() {
+  if (!confirm('确认清空全部待审批选题？已开始分析或进入生产线的项目不会受影响。')) return;
+  try {
+    var resp = await fetch('/api/pending-approvals/clear', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({all: true}),
+    });
+    var data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || ('HTTP ' + resp.status));
+    __toast('已清理 ' + (data.removed || 0) + ' 条待审批选题', 'success');
+    renderContent();
+  } catch (e) {
+    __toast('清理失败: ' + e.message, 'error');
   }
 }
 
