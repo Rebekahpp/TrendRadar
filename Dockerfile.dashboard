@@ -7,14 +7,10 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc curl ca-certificates gnupg && \
     rm -rf /var/lib/apt/lists/*
 
-# Node.js 20 + Claude Code CLI —— 生产跑 Opus 走 TokenKey CLI 模式
-# （TokenKey Claude key 拒裸 API 调用，但放行真 CLI 请求；认证纯靠 env，不需登录）
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    npm install -g @anthropic-ai/claude-code && \
-    rm -rf /var/lib/apt/lists/*
-ENV CLAUDE_CODE_DISABLE_AUTOUPDATE=1 \
-    CLAUDE_CLI_WORKDIR=/tmp/ce-cli-work
+# 生产统一走 OpenAI-compatible gateway（CE_GATEWAY_API_KEY）。
+# 不安装 Claude Code CLI：容器内没有交互登录/Max 订阅上下文，旧版 fallback 只会
+# 制造 `Claude CLI exit 1` 噪声，同时额外引入 Node.js + 全局 npm 依赖。
+ENV CLAUDE_CLI_ENABLED=0
 
 # Install Python dependencies (only what dashboard + article modules need)
 RUN pip install --no-cache-dir \
