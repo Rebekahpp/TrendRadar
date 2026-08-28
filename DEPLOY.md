@@ -16,6 +16,14 @@ Coolify 监听到镜像更新会自动拉取。
 进入 Coolify → AI Radar 服务 → Environment Variables，添加：
 
 ```env
+# ====== LLM 统一网关（必设；不要再配三把散装 key）======
+CE_GATEWAY_API_KEY=<TokenKey 全能 key>
+CE_GATEWAY_API_BASE=https://api.tokenkey.dev/v1
+CE_GATEWAY_WRITER_MODEL=claude-opus-5
+CE_GATEWAY_REVIEWER_MODEL=gpt-5.6-terra
+CE_GATEWAY_THIRD_MODEL=deepseek-v4-pro
+CLAUDE_CLI_ENABLED=0
+
 # ====== 鉴权（必设其一）======
 DASHBOARD_AUTH_USER=admin
 DASHBOARD_AUTH_PASSWORD=<生成强随机，>=20 字符>

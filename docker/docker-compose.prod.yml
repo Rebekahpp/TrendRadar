@@ -16,18 +16,22 @@ services:
     environment:
       - PORT=9090
       - CONTENT_ENGINE_PATH=/app/content-engine
-      # ---- LLM 凭证 ----
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      # ---- LLM 统一网关（主路径；全模型共用一把 key）----
+      - CE_GATEWAY_API_KEY=${CE_GATEWAY_API_KEY}
+      - CE_GATEWAY_API_BASE=${CE_GATEWAY_API_BASE:-https://api.tokenkey.dev/v1}
+      - CE_GATEWAY_WRITER_MODEL=${CE_GATEWAY_WRITER_MODEL:-claude-opus-5}
+      - CE_GATEWAY_REVIEWER_MODEL=${CE_GATEWAY_REVIEWER_MODEL:-gpt-5.6-terra}
+      - CE_GATEWAY_THIRD_MODEL=${CE_GATEWAY_THIRD_MODEL:-deepseek-v4-pro}
+      # ---- 旧 provider 仅作 gateway 缺失时的 fallback ----
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - TOKENKEY_API_KEY=${TOKENKEY_API_KEY}
       - TOKENKEY_GPT_KEY=${TOKENKEY_GPT_KEY}
       - TOKENKEY_GOOGLE_KEY=${TOKENKEY_GOOGLE_KEY:-}
       - TOKENKEY_CLAUDE_CODE_KEY=${TOKENKEY_CLAUDE_CODE_KEY:-}
       - TOKENKEY_API_BASE=${TOKENKEY_API_BASE:-https://api.tokenkey.cn}
-      # ---- CLI Opus：真 claude CLI 走 TokenKey 跑 Opus（核心 3 模型之一）----
-      - CLAUDE_CLI_ENABLED=${CLAUDE_CLI_ENABLED:-1}
-      - CLAUDE_CLI_BASE_URL=${CLAUDE_CLI_BASE_URL:-https://api.tokenkey.dev}
-      - CLAUDE_CLI_WORKDIR=/tmp/ce-cli-work
+      # 容器内无交互登录/Max 订阅上下文，禁止走 Claude CLI fallback
+      - CLAUDE_CLI_ENABLED=0
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - AIROUTER_API_KEY=${AIROUTER_API_KEY:-}
