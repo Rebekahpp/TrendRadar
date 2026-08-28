@@ -486,10 +486,13 @@ button { font-family: inherit; }
   padding: 4px 10px 6px;
   margin: 0;
   border-top: 1px solid var(--border-light);
-  overflow: hidden;
-  max-height: 60px;   /* brief 区域限高，避免挤占 pagetext 空间 */
-  flex-shrink: 0;
+  flex: 1 1 auto;    /* 与 card-pagetext 一致：填满剩余空间 */
+  min-height: 0;     /* 允许收缩，配合滚动而非硬裁切 */
+  overflow-y: auto;  /* 超长摘要滚动，避免最后一行被切一半 */
+  scrollbar-width: thin;
 }
+.news-grid .news-card .card-brief::-webkit-scrollbar { width: 4px; }
+.news-grid .news-card .card-brief::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 2px; }
 .news-grid .news-card .card-pagetext {
   font-size: 11px;
   color: var(--text-secondary);
@@ -2314,15 +2317,28 @@ function _applyBriefToCard(title, brief) {
     var titleEl = card.querySelector('.card-title') || card.querySelector('.news-title') || card.querySelector('div[style*="font-weight:600"]');
     if (!titleEl) return;
     if (titleEl.textContent.trim() === title.trim()) {
-      // New grid layout uses .card-brief, old layout uses .news-brief
+      // Grid cards are identified by .card-header/.card-meta, not .card-actions
+      var isGrid = !!(card.closest('.news-grid') || card.querySelector('.card-meta'));
       var existing = card.querySelector('.card-brief') || card.querySelector('.news-brief');
       if (existing) {
         existing.textContent = brief;
+      } else if (isGrid) {
+        // Reuse the loading/empty pagetext slot so the card keeps its flex layout
+        var slot = card.querySelector('.card-pagetext.loading, .card-pagetext.empty');
+        if (slot) {
+          slot.className = 'card-brief';
+          slot.textContent = brief;
+        } else {
+          var gridBrief = document.createElement('div');
+          gridBrief.className = 'card-brief';
+          gridBrief.textContent = brief;
+          card.appendChild(gridBrief);
+        }
       } else {
         var briefEl = document.createElement('div');
-        briefEl.className = card.querySelector('.card-actions') ? 'card-brief' : 'news-brief';
+        briefEl.className = 'news-brief';
         briefEl.textContent = brief;
-        var actionsEl = card.querySelector('.card-actions') || card.querySelector('.news-actions');
+        var actionsEl = card.querySelector('.news-actions') || card.querySelector('.card-actions');
         if (actionsEl) card.insertBefore(briefEl, actionsEl);
         else card.appendChild(briefEl);
       }
@@ -3608,13 +3624,84 @@ async function loadAnalysisDetail(filepath) {
 
 var _currentAnalysisData = null;
 var _selectedInsights = {};
+var _customPoints = [];
+
+function _customPointChipsHtml() {
+  if (!_customPoints.length) {
+    return '<span style="font-size:11px;color:var(--text-muted)">还没有添加观点</span>';
+  }
+  return _customPoints.map(function(point, idx) {
+    return '<span style="display:inline-flex;align-items:center;gap:5px;padding:5px 8px;border-radius:6px;background:#fff;border:1px solid #a7f3d0;font-size:11px;color:#065f46;max-width:100%">' +
+      '<span style="overflow-wrap:anywhere">' + escapeHtml(point) + '</span>' +
+      '<button type="button" title="删除这条观点" onclick="removeCustomPoint(' + idx + ')" style="border:none;background:transparent;color:#ef4444;cursor:pointer;font-size:14px;line-height:1;padding:0">×</button>' +
+      '</span>';
+  }).join('');
+}
+
+function _refreshCustomPointChips() {
+  var el = document.getElementById('custom-point-chips');
+  if (el) el.innerHTML = _customPointChipsHtml();
+  _refreshInsightsWriteButton();
+}
+
+function addCustomPoint() {
+  var input = document.getElementById('custom-point-input');
+  if (!input) return;
+  var point = (input.value || '').trim();
+  if (!point) { input.focus(); return; }
+  if (point.length > 500) { alert('单条观点最多 500 字'); return; }
+  if (_customPoints.length >= 20) { alert('最多添加 20 条观点'); return; }
+  if (_customPoints.indexOf(point) >= 0) { alert('这条观点已经添加过了'); return; }
+  _customPoints.push(point);
+  input.value = '';
+  _pipelineLastUserAction = Date.now();
+  _refreshCustomPointChips();
+  input.focus();
+}
+
+function removeCustomPoint(index) {
+  if (index < 0 || index >= _customPoints.length) return;
+  _customPoints.splice(index, 1);
+  _pipelineLastUserAction = Date.now();
+  _refreshCustomPointChips();
+}
+
+function _refreshInsightsWriteButton() {
+  var insightCount = Object.keys(_selectedInsights || {}).length;
+  var pointCount = _customPoints.length;
+  var total = insightCount + pointCount;
+  var iwBtn = document.getElementById('insights-write-btn');
+  if (!iwBtn) return;
+  if (total > 0) {
+    var parts = [];
+    if (insightCount) parts.push(insightCount + ' 个模型观点');
+    if (pointCount) parts.push(pointCount + ' 个我的观点');
+    iwBtn.textContent = '✍️ 写文章（' + parts.join(' + ') + '）';
+    iwBtn.style.background = 'linear-gradient(135deg,#10b981,#059669)';
+    iwBtn.style.color = 'white';
+    iwBtn.style.cursor = 'pointer';
+    iwBtn.style.boxShadow = '0 3px 12px rgba(16,185,129,0.4)';
+    iwBtn.style.animation = 'pulse-write 1.5s ease-in-out infinite';
+  } else {
+    iwBtn.textContent = '✍️ 先选观点或添加我的观点';
+    iwBtn.style.background = '#e2e8f0';
+    iwBtn.style.color = '#94a3b8';
+    iwBtn.style.cursor = 'not-allowed';
+    iwBtn.style.boxShadow = 'none';
+    iwBtn.style.animation = '';
+  }
+}
 
 function renderAnalysisDetail(container, data) {
   var prevPid = _currentAnalysisData ? _currentAnalysisData._project_id : null;
   var samePid = prevPid && prevPid === data._project_id;
   _currentAnalysisData = data;
-  // Only clear selections when switching to a different project, not on re-render of same project
-  if (!samePid) _selectedInsights = {};
+  // Only clear selections/custom points when switching to a different project,
+  // not on re-render of the same project (polling must not erase user input).
+  if (!samePid) {
+    _selectedInsights = {};
+    _customPoints = [];
+  }
   var stg = data._stage || 'insights';
   var pid = data._project_id;
 
@@ -3623,10 +3710,12 @@ function renderAnalysisDetail(container, data) {
   // 标题 + 紧凑 meta 行（替代原来的 4 个 stat-card）
   var cLen = (data.consensus_points || []).length;
   var dLen = (data.disagreement_points || []).length;
+  var _modelTotal = Object.keys(data.model_results || {}).length + Object.keys(data.errors || {}).length;
+  if (!_modelTotal) _modelTotal = data.models_succeeded || 0;
   html += '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:14px;flex-wrap:wrap">' +
     '<h3 style="margin:0;flex:1;min-width:200px;font-size:13px;line-height:1.4;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600">🔬 ' + escapeHtml((data.topic || '').split('\n')[0].substring(0, 60)) + '</h3>' +
     '<div style="display:flex;gap:14px;font-size:12px;color:var(--text-muted);align-items:center;flex-shrink:0">' +
-    '<span>✅ <strong style="color:var(--text)">' + (data.models_succeeded || 0) + '/4</strong> 模型</span>' +
+    '<span>✅ <strong style="color:var(--text)">' + (data.models_succeeded || 0) + '/' + _modelTotal + '</strong> 模型</span>' +
     '<span>💡 <strong style="color:var(--text)">' + (data.total_insights || 0) + '</strong> 洞察</span>';
   if (cLen > 0) html += '<span style="cursor:pointer;color:var(--green)" onclick="document.getElementById(\'section-consensus\').scrollIntoView({behavior:\'smooth\'})">🤝 ' + cLen + ' 共识</span>';
   if (dLen > 0) html += '<span style="cursor:pointer;color:#f59e0b" onclick="document.getElementById(\'section-disagreement\').scrollIntoView({behavior:\'smooth\'})">⚡ ' + dLen + ' 差异视角</span>';
@@ -4146,23 +4235,39 @@ async function _loadStageContentForProject(container, pid, stage) {
     if (stage === 'analysis') {
       stageHtml += '<div style="padding:16px;background:linear-gradient(135deg,#eff6ff,#dbeafe);border-radius:10px;border:1px solid #93c5fd">' +
         '<div style="font-size:14px;font-weight:700;color:#1e40af;margin-bottom:6px">🔬 多模型分析阶段</div>' +
-        '<div style="font-size:12px;color:#1e3a5f">4个大模型正在并行分析这个话题，分析完成后自动进入「选观点」阶段。</div>' +
+        '<div style="font-size:12px;color:#1e3a5f">' + _modelTotal + ' 个大模型正在并行分析这个话题，分析完成后自动进入「选观点」阶段。</div>' +
         '<div style="margin-top:10px"><button class="btn" style="font-size:12px" onclick="loadAIAnalysis()">🔄 刷新状态</button></div>' +
         '</div>';
     }
 
     if (stage === 'insights') {
       var _selN = Object.keys(_selectedInsights || {}).length;
+      var _pointN = _customPoints.length;
+      var _totalInputs = _selN + _pointN;
+      var _countParts = [];
+      if (_selN) _countParts.push(_selN + ' 个模型观点');
+      if (_pointN) _countParts.push(_pointN + ' 个我的观点');
       stageHtml += '<div style="padding:16px;background:linear-gradient(135deg,#ecfdf5,#d1fae5);border-radius:10px;border:1px solid #6ee7b7;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">' +
         '<div>' +
         '<div style="font-size:14px;font-weight:700;color:#065f46;margin-bottom:4px">💡 选观点阶段</div>' +
-        '<div style="font-size:12px;color:#064e3b">勾选下方有价值的观点 → 点右侧按钮生成文章</div>' +
+        '<div style="font-size:12px;color:#064e3b">勾选模型观点，也可以添加你的判断；两类观点会一起进入写稿。</div>' +
         '</div>' +
         '<button id="insights-write-btn" onclick="startArticleFromSelected()" style="padding:10px 20px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;white-space:nowrap;border:none;' +
-        (_selN > 0 ?
+        (_totalInputs > 0 ?
           'background:linear-gradient(135deg,#10b981,#059669);color:white;box-shadow:0 3px 12px rgba(16,185,129,0.4);animation:pulse-write 1.5s ease-in-out infinite' :
           'background:#e2e8f0;color:#94a3b8;cursor:not-allowed') +
-        '">' + (_selN > 0 ? '✍️ 写文章（' + _selN + ' 个观点）' : '✍️ 先勾选观点') + '</button>' +
+        '">' + (_totalInputs > 0 ? '✍️ 写文章（' + _countParts.join(' + ') + '）' : '✍️ 先选观点或添加我的观点') + '</button>' +
+        '</div>' +
+        '<div style="margin-top:10px;padding:12px 14px;background:#f8fffc;border:1px solid #a7f3d0;border-radius:8px">' +
+          '<div style="font-size:12px;font-weight:700;color:#065f46;margin-bottom:8px">🧠 添加我的观点</div>' +
+          '<div style="display:flex;gap:8px;align-items:stretch">' +
+            '<textarea id="custom-point-input" maxlength="500" rows="2" placeholder="输入你的判断、反驳、亲身经验或文章必须表达的观点。Ctrl/Cmd + Enter 添加。" ' +
+              'onkeydown="if((event.ctrlKey||event.metaKey)&&event.key===\'Enter\'){event.preventDefault();addCustomPoint();}" ' +
+              'style="flex:1;min-width:0;padding:8px 10px;border:1px solid #a7f3d0;border-radius:7px;font:inherit;font-size:12px;line-height:1.5;resize:vertical;outline:none"></textarea>' +
+            '<button type="button" onclick="addCustomPoint()" style="flex-shrink:0;padding:0 14px;border:none;border-radius:7px;background:#10b981;color:white;font-weight:700;cursor:pointer">＋ 添加</button>' +
+          '</div>' +
+          '<div id="custom-point-chips" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">' + _customPointChipsHtml() + '</div>' +
+          '<div style="font-size:10px;color:var(--text-muted);margin-top:6px">最多 20 条，每条 500 字；添加后可以逐条删除。</div>' +
         '</div>';
     }
 
@@ -4645,25 +4750,8 @@ function toggleInsightSelect(checkbox) {
     else bar.style.animation = '';
   }
   if (label) label.textContent = '已选 ' + count + ' 个洞察';
-  // 刷新 insights 区域的写文章按钮
-  var iwBtn = document.getElementById('insights-write-btn');
-  if (iwBtn) {
-    if (count > 0) {
-      iwBtn.textContent = '✍️ 写文章（' + count + ' 个观点）';
-      iwBtn.style.background = 'linear-gradient(135deg,#10b981,#059669)';
-      iwBtn.style.color = 'white';
-      iwBtn.style.cursor = 'pointer';
-      iwBtn.style.boxShadow = '0 3px 12px rgba(16,185,129,0.4)';
-      iwBtn.style.animation = 'pulse-write 1.5s ease-in-out infinite';
-    } else {
-      iwBtn.textContent = '✍️ 先勾选观点';
-      iwBtn.style.background = '#e2e8f0';
-      iwBtn.style.color = '#94a3b8';
-      iwBtn.style.cursor = 'not-allowed';
-      iwBtn.style.boxShadow = 'none';
-      iwBtn.style.animation = '';
-    }
-  }
+  // 刷新 insights 区域的写文章按钮（模型观点 + 我的观点统一计数）
+  _refreshInsightsWriteButton();
   // 刷新 stage bar 让「写文章」按钮实时反映选中数量
   var stageBar = document.getElementById('topic-stage-bar');
   if (stageBar && stageBar.parentElement && _currentAnalysisData) {
@@ -4719,7 +4807,10 @@ function autoSelectBestInsights() {
 function startArticleFromSelected() {
   if (!_currentAnalysisData) return;
   var ids = Object.keys(_selectedInsights);
-  if (ids.length === 0) { alert('请先勾选你认为有价值的洞察'); return; }
+  if (ids.length === 0 && _customPoints.length === 0) {
+    alert('请勾选模型观点，或添加至少一条你的观点');
+    return;
+  }
 
   var selectedInsights = [];
   var modelResults = _currentAnalysisData.model_results || {};
@@ -4737,19 +4828,31 @@ function startArticleFromSelected() {
   }
 
   var topic = _currentAnalysisData.topic;
-  var briefing = '话题: ' + topic + '\n\n你选择了 ' + selectedInsights.length + ' 个洞察:\n\n';
+  var briefing = '话题: ' + topic + '\n\n模型观点: ' + selectedInsights.length + ' 条\n我的观点: ' + _customPoints.length + ' 条\n\n';
   var showCount = Math.min(selectedInsights.length, 6);
   for (var j = 0; j < showCount; j++) {
     var s = selectedInsights[j];
     briefing += (j+1) + '. [' + (s._from || '') + '] ' + (s.title || s.core_insight || '').substring(0, 50) + '\n';
   }
   if (selectedInsights.length > showCount) {
-    briefing += '... 等共 ' + selectedInsights.length + ' 条\n';
+    briefing += '... 等共 ' + selectedInsights.length + ' 条模型观点\n';
   }
-  briefing += '\n确认要基于这些洞察生成深度文章吗？';
+  if (_customPoints.length) {
+    briefing += '\n我的观点:\n';
+    for (var cp = 0; cp < Math.min(_customPoints.length, 6); cp++) {
+      briefing += '- ' + _customPoints[cp].substring(0, 80) + '\n';
+    }
+    if (_customPoints.length > 6) briefing += '... 等共 ' + _customPoints.length + ' 条\n';
+  }
+  briefing += '\n确认要基于这些内容生成深度文章吗？';
   if (!confirm(briefing)) return;
 
-  var payload = { topic: topic, selected_insights: selectedInsights, project_id: _currentAnalysisData._project_id || null };
+  var payload = {
+    topic: topic,
+    selected_insights: selectedInsights,
+    extra_points: _customPoints.slice(),
+    project_id: _currentAnalysisData._project_id || null
+  };
   fetch('/api/generate-article', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},

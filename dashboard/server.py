@@ -1628,10 +1628,11 @@ def _launch_analysis_job(topic: str, context: str = "") -> str:
             _update_project(project_id, stage="insights", analysis_file=filepath)
             _add_project_event(project_id, "analysis_done",
                                f"分析完成: {rd.get('total_insights', 0)} 个洞察")
+            model_total = rd.get('models_succeeded', 0) + rd.get('models_failed', 0)
             _send_feishu_notification(
                 f"✅ 分析完成: {topic}",
                 f"**话题**: {topic}\n"
-                f"**成功模型**: {rd.get('models_succeeded', 0)}/4\n"
+                f"**成功模型**: {rd.get('models_succeeded', 0)}/{model_total}\n"
                 f"**总洞察数**: {rd.get('total_insights', 0)}\n"
                 f"**共识观点**: {len(rd.get('consensus_points', []))} 个\n"
                 f"**分歧观点**: {len(rd.get('disagreement_points', []))} 个\n\n"
@@ -2374,6 +2375,25 @@ def _reparse_failed_insights(data: dict, fpath: str) -> dict:
     return data
 
 
+def _normalize_extra_points(raw) -> list[str]:
+    """Validate/dedupe user-authored viewpoints from the browser.
+
+    Browser maxlength/count checks are convenience only; API callers can bypass
+    them. Keep one canonical server-side contract: array, max 20, max 500 chars,
+    no blanks/duplicates/non-strings.
+    """
+    if not isinstance(raw, list):
+        raise ValueError("extra_points must be an array")
+    cleaned = []
+    for point in raw[:20]:
+        if not isinstance(point, str):
+            continue
+        point = point.strip()
+        if point and point not in cleaned:
+            cleaned.append(point[:500])
+    return cleaned
+
+
 class DashboardHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=DASHBOARD_DIR, **kwargs)
@@ -2828,12 +2848,22 @@ class DashboardHandler(SimpleHTTPRequestHandler):
     def _start_article_gen(self, body):
         """Generate article from analysis results or selected insights."""
         selected_insights = body.get("selected_insights", [])
+        extra_points = body.get("extra_points", [])
         topic = body.get("topic", "")
         analysis_file = body.get("analysis_file", "")
         project_id = body.get("project_id")
 
-        if not selected_insights and not analysis_file:
-            self._json({"error": "need selected_insights or analysis_file"})
+        if not isinstance(selected_insights, list):
+            self._json({"error": "selected_insights must be an array"})
+            return
+        try:
+            extra_points = _normalize_extra_points(extra_points)
+        except ValueError as exc:
+            self._json({"error": str(exc)})
+            return
+
+        if not selected_insights and not analysis_file and not extra_points:
+            self._json({"error": "need selected_insights, analysis_file, or extra_points"})
             return
 
         job_id = f"article_{int(datetime.now().timestamp())}"
@@ -2841,12 +2871,16 @@ class DashboardHandler(SimpleHTTPRequestHandler):
 
         if project_id:
             _update_project(project_id, stage="writing")
-            _add_project_event(project_id, "writing_started", f"基于 {len(selected_insights)} 个洞察开始写作")
+            _add_project_event(
+                project_id,
+                "writing_started",
+                f"基于 {len(selected_insights)} 个模型洞察 + {len(extra_points)} 个用户观点开始写作",
+            )
 
         def run():
             try:
                 from article.generator import generate_article, save_article
-                if selected_insights:
+                if selected_insights or extra_points:
                     analysis = {
                         "topic": topic,
                         "selected_insights": selected_insights,
@@ -2855,7 +2889,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 else:
                     with open(analysis_file, "r", encoding="utf-8") as f:
                         analysis = json.load(f)
-                article = generate_article(analysis)
+                article = generate_article(analysis, extra_points=extra_points)
 
                 # 生成配图并嵌入文章
                 updated_content, img_results = _generate_and_embed_images(article["content"])
