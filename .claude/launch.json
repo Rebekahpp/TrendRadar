@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ai-radar",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["/Users/Zhuanz/Documents/daima/TrendRadar/dashboard/server.py"],
+      "port": 9090
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+# Data files
+output/
+*.db
+workflow.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+
+# Environment
+.env
+docker/.env
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Claude
+.claude/worktrees/
+.claude/projects/
