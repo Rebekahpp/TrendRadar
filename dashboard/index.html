@@ -1955,21 +1955,8 @@ async function switchAiDate(filter) {
     items.sort(function(a,b) { return (b.ai_score||0) - (a.ai_score||0); });
     aiFiltered = items;
   } else if (filter === 'last-30d') {
-    // 近30天聚合
-    var items = [];
-    var seen = {};
-    for (var i = 0; i < 30; i++) {
-      var dd = new Date(); dd.setDate(dd.getDate() - i);
-      var ds = dd.toISOString().slice(0,10);
-      if (availableDates.indexOf(ds) >= 0) {
-        var dayItems = await fetchJSON('/api/ai-filtered?date=' + ds);
-        dayItems.forEach(function(it) {
-          if (!seen[it.title]) { seen[it.title] = true; it.data_date = ds; items.push(it); }
-        });
-      }
-    }
-    items.sort(function(a,b) { return (b.ai_score||0) - (a.ai_score||0); });
-    aiFiltered = items;
+    // 近30天由后端一次聚合。旧版逐日串行发 30 个请求，慢且容易撞 rate limit。
+    aiFiltered = await fetchJSON('/api/ai-filtered?days=30');
   } else {
     // 具体某一天
     aiFiltered = await fetchJSON('/api/ai-filtered?date=' + filter);

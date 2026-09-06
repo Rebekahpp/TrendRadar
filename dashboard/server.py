@@ -1079,12 +1079,18 @@ def _get_recent_dates(days=3):
     return dates
 
 
-def get_ai_filtered(date=None):
-    """Return news items that passed AI filter, merged from recent days.
+def get_ai_filtered(date=None, days=3):
+    """Return news items that passed AI filter.
 
-    If date is specified, only return that day's data.
-    If date is None, merge the most recent 3 days to ensure continuity.
+    If date is specified, only return that day. Otherwise merge the most recent
+    ``days`` available dates (default 3, max 30). The range parameter lets the
+    search UI expand to 30 days with one request instead of issuing 30 sequential
+    API calls (or 30 concurrent calls that hit the dashboard rate limiter).
     """
+    try:
+        days = max(1, min(30, int(days or 3)))
+    except (TypeError, ValueError):
+        days = 3
     if date:
         items = _get_ai_filtered_single(date)
         # Attach cached briefs for single-date queries too
@@ -1105,7 +1111,7 @@ def get_ai_filtered(date=None):
                 it["page_text_status"] = pt[u]["status"]
         return items
 
-    recent_dates = _get_recent_dates(3)
+    recent_dates = _get_recent_dates(days)
     if not recent_dates:
         return []
 
@@ -4099,7 +4105,10 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "/api/stats": lambda: get_stats(date),
             "/api/tags": lambda: get_ai_tags(date),
             "/api/ai-results": lambda: get_ai_results(date),
-            "/api/ai-filtered": lambda: get_ai_filtered(date),
+            "/api/ai-filtered": lambda: get_ai_filtered(
+                date,
+                params.get("days", ["3"])[0],
+            ),
             "/api/ai-analysis": lambda: read_ai_analysis() or "",
             "/api/dates": get_available_dates,
             "/api/jobs": lambda: _running_jobs,
