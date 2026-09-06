@@ -4903,6 +4903,20 @@ function togglePanel(el) {
   icon.classList.toggle('open');
 }
 
+function normalizeSearchText(value) {
+  // 容错搜索：Gemini 3.8 / gemini3.8 / gemini-3-8 / GEMINI_3.8 应视为同一串。
+  // 保留中文、字母和数字，去掉空格、点、横线、下划线和其他标点。
+  return String(value || '').toLowerCase().replace(/[^a-z0-9\u3400-\u9fff]+/g, '');
+}
+
+function itemMatchesSearch(item, query) {
+  var haystack = [
+    item.title || '', item.brief || '', item.summary || '',
+    item.source || '', item.platform_name || '', item.feed_name || ''
+  ].join(' ');
+  return normalizeSearchText(haystack).includes(normalizeSearchText(query));
+}
+
 function getItems() {
   var items = [];
   if (currentView === 'ai') {
@@ -4953,8 +4967,7 @@ function getItems() {
     items = items.filter(function(i) { return i.tag === currentTag; });
   }
   if (searchQuery) {
-    var q = searchQuery.toLowerCase();
-    items = items.filter(function(i) { return i.title.toLowerCase().includes(q); });
+    items = items.filter(function(i) { return itemMatchesSearch(i, searchQuery); });
   }
   return items;
 }
@@ -7086,8 +7099,14 @@ function copyComment(idx) {
   }
 }
 
-document.getElementById('search').addEventListener('input', function(e) {
+document.getElementById('search').addEventListener('input', async function(e) {
   searchQuery = e.target.value;
+  // AI 精选默认只装载近 3 天。用户主动搜索时自动扩到近 30 天，否则 9/3 的
+  // Gemini 3.8 在 9/6 搜索永远为 0，容易误判为系统没抓到。
+  if (searchQuery.trim() && currentView === 'ai' && aiDateFilter === 'recent') {
+    await switchAiDate('last-30d');
+    return;
+  }
   renderContent();
 });
 
