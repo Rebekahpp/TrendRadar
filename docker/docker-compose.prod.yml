@@ -1,0 +1,92 @@
+version: "3.8"
+
+services:
+  ai-radar:
+    image: ghcr.io/rebekahpp/ai-radar:latest
+    container_name: ai-radar
+    restart: unless-stopped
+    # 资源上限，避免单服务把宿主机压垮
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "1.5"
+        reservations:
+          memory: 512M
+    environment:
+      - PORT=9090
+      - CONTENT_ENGINE_PATH=/app/content-engine
+      # ---- LLM 统一网关（主路径；全模型共用一把 key）----
+      - CE_GATEWAY_API_KEY=${CE_GATEWAY_API_KEY}
+      - CE_GATEWAY_API_BASE=${CE_GATEWAY_API_BASE:-https://api.tokenkey.dev/v1}
+      - CE_GATEWAY_WRITER_MODEL=${CE_GATEWAY_WRITER_MODEL:-claude-opus-5}
+      - CE_GATEWAY_REVIEWER_MODEL=${CE_GATEWAY_REVIEWER_MODEL:-gpt-5.6-terra}
+      - CE_GATEWAY_THIRD_MODEL=${CE_GATEWAY_THIRD_MODEL:-deepseek-v4-pro}
+      # ---- 旧 provider 仅作 gateway 缺失时的 fallback ----
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - TOKENKEY_API_KEY=${TOKENKEY_API_KEY}
+      - TOKENKEY_GPT_KEY=${TOKENKEY_GPT_KEY}
+      - TOKENKEY_GOOGLE_KEY=${TOKENKEY_GOOGLE_KEY:-}
+      - TOKENKEY_CLAUDE_CODE_KEY=${TOKENKEY_CLAUDE_CODE_KEY:-}
+      - TOKENKEY_API_BASE=${TOKENKEY_API_BASE:-https://api.tokenkey.cn}
+      # 容器内无交互登录/Max 订阅上下文，禁止走 Claude CLI fallback
+      - CLAUDE_CLI_ENABLED=0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AIROUTER_API_KEY=${AIROUTER_API_KEY:-}
+      - AIROUTER_API_BASE=${AIROUTER_API_BASE:-}
+      # ---- Stage 1+2 安全配置 ----
+      - DASHBOARD_AUTH_USER=${DASHBOARD_AUTH_USER:-}
+      - DASHBOARD_AUTH_PASSWORD=${DASHBOARD_AUTH_PASSWORD:-}
+      - DASHBOARD_BEARER_TOKEN=${DASHBOARD_BEARER_TOKEN:-}
+      - DASHBOARD_ALLOWED_ORIGINS=${DASHBOARD_ALLOWED_ORIGINS:-https://content.orbitlogic.dev}
+      - DASHBOARD_MAX_BODY_SIZE=${DASHBOARD_MAX_BODY_SIZE:-10485760}
+      - DASHBOARD_RATE_GENERAL=${DASHBOARD_RATE_GENERAL:-10}
+      - DASHBOARD_RATE_LLM=${DASHBOARD_RATE_LLM:-1}
+      - DASHBOARD_RATE_BURST=${DASHBOARD_RATE_BURST:-30}
+      - DASHBOARD_LLM_TOPIC_MAX=${DASHBOARD_LLM_TOPIC_MAX:-500}
+      - DASHBOARD_LLM_CONTEXT_MAX=${DASHBOARD_LLM_CONTEXT_MAX:-20000}
+      - DASHBOARD_LLM_TEXT_MAX=${DASHBOARD_LLM_TEXT_MAX:-30000}
+      - CONSOLE_PASSWORD=${CONSOLE_PASSWORD:-}
+      # ---- Stage 2.6 Sentry error monitoring ----
+      - SENTRY_BACKEND_DSN=${SENTRY_BACKEND_DSN:-}
+      - SENTRY_FRONTEND_DSN=${SENTRY_FRONTEND_DSN:-}
+      - SENTRY_ENVIRONMENT=${SENTRY_ENVIRONMENT:-production}
+      - SENTRY_RELEASE=${SENTRY_RELEASE:-ai-radar@stage2.6}
+      - SENTRY_TRACES_SAMPLE_RATE=${SENTRY_TRACES_SAMPLE_RATE:-0.05}
+      # ---- Feishu / WeChat 凭证（如使用）----
+      # ---- 内容引擎 / 选题推荐 / 配图 ----
+      - TRENDRADAR_OUTPUT=/data/output
+      - HIDREAM_API_URL=${HIDREAM_API_URL:-}
+      - HIDREAM_API_TOKEN=${HIDREAM_API_TOKEN:-}
+      - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
+      - WECHAT_APP_ID=${WECHAT_APP_ID:-}
+      - WECHAT_APP_SECRET=${WECHAT_APP_SECRET:-}
+      - DASHBOARD_URL=${DASHBOARD_URL:-https://content.orbitlogic.dev}
+    volumes:
+      - ai-radar-output:/data/output
+      - ai-radar-content:/data/content-data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:9090/healthz',timeout=3); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    # 日志限制，避免单容器把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    networks:
+      - coolify
+    # Traefik routing 仍由 /traefik/dynamic/ai-radar.yaml 提供
+
+volumes:
+  ai-radar-output:
+  ai-radar-content:
+
+networks:
+  coolify:
+    external: true

@@ -22,14 +22,41 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# 凭证 / 环境变量绝不进镜像
+.env
+.env.*
+.env.local
+.env.*.local
+**/.env
+**/.env.*
 docker/.env
+*.pem
+*.key
+*.crt
+*.pfx
 
 _image/
 
 .github/
 
 *.log
-.env.local
-.env.*.local
 version
 index.html
+
+# 备份与本地数据（运行时通过 volume 挂载）
+content-data/
+backup/
+backups/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-journal
+
+# 内部开发笔记
+PROGRESS.md
+.claude/
+.cursor/
+notes/
+ARCHIVE/
+plan/
