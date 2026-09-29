@@ -6,12 +6,14 @@ WORKDIR /app
 RUN pip install --no-cache-dir httpx openai google-genai pyyaml feedparser
 
 # Copy dashboard files
-COPY TrendRadar/dashboard/ /app/dashboard/
+COPY dashboard/ /app/dashboard/
 
 # Copy content-engine (for article generation, topic detection, analytics, etc.)
 COPY content-engine/article/ /app/content-engine/article/
 COPY content-engine/brain/ /app/content-engine/brain/
 COPY content-engine/core/ /app/content-engine/core/
+COPY content-engine/feishu/ /app/content-engine/feishu/
+COPY content-engine/input/ /app/content-engine/input/
 COPY content-engine/config.yaml /app/content-engine/config.yaml
 
 # Create necessary directories

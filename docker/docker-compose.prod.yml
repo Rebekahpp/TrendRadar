@@ -63,6 +63,9 @@ services:
       - FEISHU_WEBHOOK_URL=${FEISHU_WEBHOOK_URL:-}
       - WECHAT_APP_ID=${WECHAT_APP_ID:-}
       - WECHAT_APP_SECRET=${WECHAT_APP_SECRET:-}
+      # 公众号数据商（极致了）——可选；没有配置时仍可用 RSS/手动导入
+      - JIZHILE_API_KEY=${JIZHILE_API_KEY:-}
+      - JIZHILE_API_BASE=${JIZHILE_API_BASE:-https://www.dajiala.com}
       - DASHBOARD_URL=${DASHBOARD_URL:-https://content.orbitlogic.dev}
     volumes:
       - ai-radar-output:/data/output
