@@ -1169,6 +1169,31 @@ def _get_ai_filtered_single(date):
             n["ai_score"] = tagged_ids[n["id"]]["score"]
             n["ai_tags"] = tagged_ids[n["id"]]["tags"]
             filtered.append(n)
+
+    # 微信公众号深度/竞品文章并入 AI 精选
+    try:
+        from article.analytics import get_wechat_content_pool
+        wechat_items = get_wechat_content_pool(date=date, lookback_days=1, per_account=10)
+        for w in wechat_items:
+            acc_name = w.get("account_name", "公众号")
+            filtered.append({
+                "id": f"wechat_{w.get('id')}",
+                "title": w.get("title", ""),
+                "platform_id": 999,
+                "rank": w.get("account_rank", 1),
+                "url": w.get("url", ""),
+                "mobile_url": w.get("url", ""),
+                "first_crawl_time": (w.get("publish_date") or "") + " 00:00",
+                "last_crawl_time": (w.get("publish_date") or "") + " 12:00",
+                "crawl_count": 1,
+                "platform_name": f"公众号·{acc_name}",
+                "ai_score": 92,
+                "ai_tags": ["AI公众号"],
+                "brief": w.get("content_summary", ""),
+            })
+    except Exception as e:
+        print(f"[Dashboard] Failed to merge WeChat articles into AI filter: {e}")
+
     filtered.sort(key=lambda x: x["ai_score"], reverse=True)
     return filtered
 
@@ -1971,7 +1996,7 @@ def _get_engagement(date=None, item_id=None):
     # 不指定 item_id：返回当日所有新闻的最新热度
     rows = query_db(db, """
         SELECT e.news_item_id, e.views, e.likes, e.comments, e.shares, e.snapshot_time,
-               n.title, n.platform_id
+               n.title, n.platform_id, n.url
         FROM engagement_snapshots e
         JOIN news_items n ON n.id = e.news_item_id
         WHERE e.id IN (
@@ -1987,7 +2012,7 @@ def _get_engagement(date=None, item_id=None):
                MAX(1, 101 - r.rank) as views,
                0 as likes, 0 as comments, 0 as shares,
                r.crawl_time as snapshot_time,
-               n.title, n.platform_id
+               n.title, n.platform_id, n.url
         FROM rank_history r
         JOIN news_items n ON n.id = r.news_item_id
         WHERE r.id IN (
@@ -2071,6 +2096,7 @@ def _get_topic_trends(top_n=10):
             """, (ev["id"],)).fetchall()
 
             result.append({
+                "event_id": ev["id"],
                 "event_name": ev["event_name"],
                 "lifecycle_stage": ev["lifecycle_stage"],
                 "total_articles": ev["total_articles"],
@@ -2082,6 +2108,26 @@ def _get_topic_trends(top_n=10):
                 ],
             })
         return result
+    finally:
+        conn.close()
+
+
+def _get_event_detail(event_id):
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return {"error": "无效事件编号"}
+    conn = _workflow_conn()
+    try:
+        event = conn.execute("SELECT * FROM topic_events WHERE id=?", (event_id,)).fetchone()
+        if not event:
+            return {"error": "事件不存在"}
+        rows = conn.execute(
+            "SELECT id,article_title,source,data_date,url,is_ours FROM event_articles "
+            "WHERE event_id=? ORDER BY data_date DESC,id DESC LIMIT 200", (event_id,)
+        ).fetchall()
+        return {"event": dict(event), "articles": [dict(row) for row in rows],
+                "note": "收录来源内的关联文章，不代表全网；同品牌关联不等于同一事件或独立证据。"}
     finally:
         conn.close()
 
@@ -4130,6 +4176,7 @@ class DashboardHandler(SimpleHTTPRequestHandler):
             "/api/projects": lambda: _list_projects(params.get("stage", [""])[0]),
             "/api/engagement": lambda: _get_engagement(date, params.get("item_id", [None])[0]),
             "/api/topic-events": lambda: _get_topic_events(),
+            "/api/event-detail": lambda: _get_event_detail(params.get("id", [None])[0]),
             "/api/topic-trends": lambda: _get_topic_trends(int(params.get("top", ["10"])[0])),
             "/api/topic-hits": lambda: _get_topic_hits(params.get("week", [None])[0]),
             "/api/system-health": lambda: _get_system_health(),

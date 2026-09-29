@@ -1104,6 +1104,7 @@ button { font-family: inherit; }
     max-height: none;
   }
 }
+
 </style>
 </head>
 <body>
@@ -5322,6 +5323,46 @@ function renderContent() {
   }
 }
 
+function trackingSafeUrl(url) {
+  try { var u = new URL(url); return /^https?:$/.test(u.protocol) ? escapeHtml(u.href).replace(/"/g, '&quot;') : '#'; }
+  catch (_) { return '#'; }
+}
+
+async function openTrackingEvent(id, date) {
+  var previous = document.getElementById('tracking-event-dialog');
+  if (previous) previous.remove();
+  var dialog = document.createElement('dialog');
+  dialog.id = 'tracking-event-dialog';
+  dialog.style.cssText = 'width:min(880px,92vw);max-height:85vh;overflow:auto;padding:20px;border:1px solid #cbd5e1;border-radius:12px';
+  dialog.innerHTML = '<button type="button" style="float:right" aria-label="关闭详情">关闭</button><h2>主题关联来源</h2><div aria-live="polite">正在读取…</div>';
+  dialog.querySelector('button').onclick = function() { dialog.close(); dialog.remove(); };
+  document.body.appendChild(dialog); dialog.showModal();
+  var area = dialog.querySelector('[aria-live]');
+  try {
+    var response = await fetch('/api/event-detail?id=' + encodeURIComponent(id));
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    var data = await response.json();
+    if (data.error) throw new Error(data.error);
+    dialog.querySelector('h2').textContent = data.event.event_name + (date ? ' · ' + date : '');
+    area.textContent = '';
+    var note = document.createElement('p');
+    note.textContent = data.note + ' 未覆盖表示尚未匹配到我们的内容，不等于采集缺失。';
+    area.appendChild(note);
+    var rows = (data.articles || []).filter(function(a) { return !date || a.data_date === date; });
+    if (!rows.length) { var empty = document.createElement('p'); empty.textContent = '当前范围没有关联原文，不能仅凭品牌名称自动写稿。'; area.appendChild(empty); }
+    rows.forEach(function(a) {
+      var row = document.createElement('div'); row.style.cssText = 'padding:12px 0;border-top:1px solid #e2e8f0';
+      var link = document.createElement('a'); link.textContent = a.article_title;
+      try { var u = new URL(a.url); if (/^https?:$/.test(u.protocol)) { link.href = u.href; link.target='_blank'; link.rel='noopener noreferrer'; } } catch (_) {}
+      row.appendChild(link);
+      var meta = document.createElement('p'); meta.textContent = (a.source || '未知来源') + ' · ' + (a.data_date || '日期未知'); row.appendChild(meta);
+      var pick = document.createElement('button'); pick.type='button'; pick.textContent='加入选题';
+      pick.onclick=function() { togglePickAndUpdate(a.article_title, a.url || '', a.source || ''); pick.textContent='已加入选题'; pick.disabled=true; };
+      row.appendChild(pick); area.appendChild(row);
+    });
+  } catch (e) { area.textContent='读取失败：' + e.message; }
+}
+
 async function renderDataTracking() {
   var content = document.getElementById('content');
   content.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-muted)">加载中...</div>';
@@ -5338,8 +5379,8 @@ async function renderDataTracking() {
     var stageColors = {emerging:'#f59e0b', growing:'#3b82f6', peak:'#ef4444', declining:'#9ca3af', ended:'#d1d5db'};
 
     // ═══ 板块一：热度趋势排行 ═══
-    html += '<div class="section-bar"><h3>🔥 全网热度排行</h3>' +
-      '<span style="font-size:12px;color:var(--text-muted)">近 5 天 · 按总报道量排序 · 基于 AI 精选聚类</span></div>';
+    html += '<div class="section-bar"><h3>🔥 收录主题趋势</h3>' +
+      '<span style="font-size:12px;color:var(--text-muted)">按累计收录量排序 · 图表展示近30天 · 品牌关联不代表独立事件</span></div>';
 
     if (Array.isArray(trends) && trends.length > 0) {
       // 收集所有出现的日期
@@ -5347,7 +5388,9 @@ async function renderDataTracking() {
       trends.forEach(function(t) {
         (t.daily_trend || []).forEach(function(d) { allDates[d.date] = 1; });
       });
-      var dateList = Object.keys(allDates).sort();
+      var cutoff = new Date(); cutoff.setDate(cutoff.getDate() - 29);
+      var cutoffDate = cutoff.toISOString().slice(0, 10);
+      var dateList = Object.keys(allDates).sort().filter(function(d) { return d >= cutoffDate; });
       var maxArticles = Math.max.apply(null, trends.map(function(t) { return t.total_articles || 1; }));
 
       html += '<div style="display:flex;flex-direction:column;gap:10px;margin-bottom:24px">';
@@ -5363,34 +5406,30 @@ async function renderDataTracking() {
         (t.daily_trend || []).forEach(function(d) { dailyMap[d.date] = d.count; });
         var maxDaily = Math.max.apply(null, dateList.map(function(d) { return dailyMap[d] || 0; }).concat([1]));
 
-        var sparkHtml = '<div style="display:flex;align-items:flex-end;gap:2px;height:28px">';
+        var sparkHtml = '<div style="display:flex;align-items:flex-end;gap:2px;height:44px;min-width:0">';
         dateList.forEach(function(d) {
           var cnt = dailyMap[d] || 0;
           var h = cnt > 0 ? Math.max(4, Math.round((cnt / maxDaily) * 28)) : 0;
-          sparkHtml += '<div title="' + d.slice(5) + ': ' + cnt + '篇" style="width:' + Math.max(14, Math.floor(100/dateList.length)) + 'px;height:' + h + 'px;background:' + (cnt > 0 ? color : '#f1f5f9') + ';border-radius:2px 2px 0 0;transition:height 0.3s"></div>';
+          sparkHtml += '<button type="button" aria-label="' + d + '，' + cnt + '篇，查看来源" onclick="openTrackingEvent(' + Number(t.event_id) + ',\'' + d + '\')" title="' + d + ': ' + cnt + '篇" style="flex:1;min-width:0;padding:0;border:0;cursor:pointer;height:' + Math.max(4,h) + 'px;background:' + (cnt > 0 ? color : '#e2e8f0') + ';border-radius:2px"></button>';
         });
         sparkHtml += '</div>';
 
         // 日期标签
-        var dateLabelHtml = '<div style="display:flex;gap:2px;margin-top:1px">';
-        dateList.forEach(function(d) {
-          dateLabelHtml += '<div style="width:' + Math.max(14, Math.floor(100/dateList.length)) + 'px;text-align:center;font-size:9px;color:#9ca3af">' + d.slice(5) + '</div>';
-        });
-        dateLabelHtml += '</div>';
+        var dateLabelHtml = '<div style="display:flex;justify-content:space-between;white-space:nowrap;margin-top:4px;font-size:11px;color:#64748b"><span>' + (dateList[0] || '').slice(5) + '</span><span>' + (dateList[dateList.length-1] || '').slice(5) + '</span></div>';
 
-        html += '<div style="display:flex;align-items:center;gap:12px;padding:10px 14px;border:1px solid #f1f5f9;border-radius:8px;background:white;border-left:3px solid ' + color + '">' +
+        html += '<div class="tracking-trend-row" style="padding:12px 14px;border:1px solid #e2e8f0;border-radius:8px;background:white;border-left:3px solid ' + color + '">' +
           '<span style="font-size:16px;font-weight:800;color:' + rankColor + ';min-width:24px;text-align:center">' + (idx + 1) + '</span>' +
           '<div style="flex:1;min-width:0">' +
             '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">' +
-              '<span style="font-size:14px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + escapeHtml(t.event_name) + '</span>' +
+              '<button type="button" class="tracking-title" onclick="openTrackingEvent(' + Number(t.event_id) + ')">' + escapeHtml(t.event_name) + '</button>' +
               '<span style="font-size:10px;padding:1px 6px;border-radius:8px;background:' + color + '18;color:' + color + ';font-weight:600;white-space:nowrap">' + icon + '</span>' +
             '</div>' +
-            '<div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)">' +
-              '<span style="font-weight:600;color:' + rankColor + '">' + (t.total_articles || 0) + ' 篇</span>' +
-              '<span>· 始于 ' + (t.start_date || '—') + '</span>' +
+            '<div style="display:flex;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--text-muted)">' +
+              '<span style="white-space:nowrap;font-weight:600;color:' + rankColor + '">' + (t.total_articles || 0) + ' 篇</span>' +
+              '<span style="white-space:nowrap">· 首次收录 ' + (t.start_date || '—') + '</span>' +
             '</div>' +
           '</div>' +
-          '<div style="min-width:120px">' + sparkHtml + dateLabelHtml + '</div>' +
+          '<div style="min-width:0;width:100%">' + sparkHtml + dateLabelHtml + '</div>' +
         '</div>';
       });
       html += '</div>';
@@ -5407,17 +5446,17 @@ async function renderDataTracking() {
       var hrColor = hitRate >= 60 ? '#10b981' : hitRate >= 30 ? '#f59e0b' : '#ef4444';
       var verdictColors = {'爆了':'#ef4444','抓住了':'#10b981','在写':'#3b82f6','有分析':'#f59e0b','没抓住':'#9ca3af','未覆盖':'#d1d5db'};
 
-      html += '<div class="section-bar"><h3>🎯 选题命中率</h3>' +
+      html += '<div class="section-bar"><h3>🎯 内容覆盖进度</h3>' +
         '<span style="font-size:12px;color:var(--text-muted)">覆盖 ' + hitCount + '/' + totalEvents + ' 个热点 · ' +
         '<strong style="color:' + hrColor + '">' + hitRate + '%</strong></span></div>';
       html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:8px;margin-bottom:24px">';
       topicHits.forEach(function(h) {
         var color = verdictColors[h.verdict] || '#6b7280';
-        html += '<div style="padding:8px 12px;border:1px solid #e5e7eb;border-radius:8px;background:white">' +
+        html += '<button type="button" onclick="openTrackingEvent(' + Number(h.event_id) + ')" style="text-align:left;cursor:pointer;min-width:0;padding:12px;border:1px solid #e5e7eb;border-radius:8px;background:white">' +
           '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">' +
           '<span style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1">' + escapeHtml(h.event_name || '') + '</span>' +
           '<span style="font-size:10px;padding:1px 6px;border-radius:8px;background:' + color + '18;color:' + color + ';font-weight:700;white-space:nowrap;margin-left:6px">' + escapeHtml(h.verdict) + '</span></div>' +
-          '<div style="font-size:11px;color:var(--text-muted)">全网 ' + (h.total_event_views || 0) + ' 篇 · ' + (h.lifecycle_stage || '') + '</div></div>';
+          '<div style="font-size:11px;color:var(--text-muted)">关联统计 ' + (h.total_event_views || 0) + ' · ' + ({emerging:'出现',growing:'上升',peak:'高峰',declining:'回落',ended:'结束'}[h.lifecycle_stage] || '未知') + ' · 点击查看来源</div></button>';
       });
       html += '</div>';
     }
@@ -5482,7 +5521,7 @@ async function loadHeatRanking() {
       hHtml += '<div style="display:flex;align-items:center;gap:10px;padding:6px 12px;border-radius:6px;background:white;border:1px solid #f1f5f9">' +
         '<span style="font-weight:700;color:' + rankColor + ';min-width:20px;text-align:center">' + (idx + 1) + '</span>' +
         '<div style="flex:1;overflow:hidden">' +
-        '<div style="font-size:13px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + escapeHtml(item.title || '—') + '</div>' +
+        '<a href="' + trackingSafeUrl(item.url) + '" target="_blank" rel="noopener noreferrer" style="display:block;color:inherit;font-size:13px;font-weight:500;line-height:1.6;overflow-wrap:anywhere">' + escapeHtml(item.title || '—') + '</a>' +
         '<div style="height:4px;background:#f1f5f9;border-radius:2px;margin-top:3px"><div style="height:100%;width:' + pct + '%;background:linear-gradient(90deg,' + rankColor + ',' + rankColor + '66);border-radius:2px"></div></div>' +
         '</div>' +
         '<div style="text-align:right;min-width:80px">' +
